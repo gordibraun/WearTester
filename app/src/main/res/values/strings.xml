@@ -1,0 +1,26 @@
+<resources>
+    <string name="app_name">WearTester</string>
+    <string name="watch_face_name">Dexcom Live</string>
+    <string name="title_dexcom_setup">Dexcom Setup</string>
+    <string name="help_dexcom_setup">Введите код трансмиттера и код сенсора, затем запустите подключение на часах.</string>
+    <string name="hint_transmitter_id">Код трансмиттера, например 89W58K</string>
+    <string name="hint_sensor_code">Код сенсора, например 1234</string>
+    <string name="button_save">Сохранить</string>
+    <string name="button_edit_transmitter">Изменить трансмиттер</string>
+    <string name="button_edit_sensor">Изменить сенсор</string>
+    <string name="button_start">Запустить подключение</string>
+    <string name="button_stop">Остановить</string>
+    <string name="dialog_title_transmitter">Новый код трансмиттера</string>
+    <string name="dialog_title_sensor">Новый код сенсора</string>
+    <string name="config_saved">Настройки сохранены</string>
+    <string name="status_started">Сервис запущен</string>
+    <string name="status_stopped">Сервис остановлен</string>
+    <string name="status_permissions_ok">Разрешения подтверждены, запускаю подключение</string>
+    <string name="status_permissions_request">Нужно подтвердить разрешения: %1$s</string>
+    <string name="status_permissions_missing">Не все разрешения выданы: %1$s</string>
+    <string name="status_permissions_granted">Разрешения BLE выданы</string>
+    <string name="status_permissions_missing_short">Не хватает разрешений: %1$s</string>
+    <string name="status_empty_value">не задан</string>
+    <string name="status_summary">Трансмиттер: %1$s\nСенсор: %2$s</string>
+    <string name="status_scan_debug">Последний Dexcom scan:\nИмя: %1$s\nMAC: %2$s\nRSSI: %3$s\nСобытие: %4$s</string>
+</resources>

@@ -1,0 +1,4 @@
+<resources>
+    <bool name="watch_face_editable">true</bool>
+    <bool name="watch_face_flavors_supported">false</bool>
+</resources>

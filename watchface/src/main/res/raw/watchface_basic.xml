@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WatchFace width="300" height="300">
+    <Scene backgroundColor="#000000">
+        <Group name="static_text" x="0" y="0" width="300" height="300">
+            <DigitalClock x="0" y="34" width="300" height="58">
+                <TimeText x="0" y="0" width="300" height="58" format="hh:mm">
+                    <Font family="SYNC_TO_DEVICE" size="50" color="#FFFFFF" />
+                </TimeText>
+            </DigitalClock>
+
+            <PartText x="0" y="92" width="300" height="24" alpha="255">
+                <Text align="CENTER">
+                    <Font family="SYNC_TO_DEVICE" size="18" color="#4DD0E1">
+                        <![CDATA[Dexcom Live]]>
+                    </Font>
+                </Text>
+            </PartText>
+
+            <PartText x="0" y="240" width="300" height="24" alpha="255">
+                <Text align="CENTER">
+                    <Font family="SYNC_TO_DEVICE" size="18" color="#4DD0E1">
+                        <![CDATA[mg/dL]]>
+                    </Font>
+                </Text>
+            </PartText>
+        </Group>
+
+        <ComplicationSlot
+            slotId="0"
+            x="46"
+            y="126"
+            width="208"
+            height="96"
+            name="glucose"
+            displayName="@string/glucose_slot_name"
+            supportedTypes="SHORT_TEXT EMPTY"
+            isCustomizable="TRUE">
+            <BoundingOval x="0" y="0" width="208" height="96" />
+            <DefaultProviderPolicy
+                primaryProvider="com.example.weartester/com.example.weartester.DexcomGlucoseComplicationService"
+                primaryProviderType="SHORT_TEXT"
+                defaultSystemProvider="WATCH_BATTERY"
+                defaultSystemProviderType="SHORT_TEXT" />
+            <Complication type="SHORT_TEXT">
+                <Group name="glucose_value" x="0" y="0" width="208" height="96">
+                    <PartText x="0" y="0" width="208" height="64" alpha="255">
+                        <Text align="CENTER">
+                            <Font family="SYNC_TO_DEVICE" size="64" weight="BOLD" color="#7CFF7C">
+                                <Template><![CDATA[%s]]><Parameter expression="[COMPLICATION.TEXT]" /></Template>
+                            </Font>
+                        </Text>
+                    </PartText>
+
+                    <PartText x="0" y="66" width="208" height="24" alpha="255">
+                        <Text align="CENTER">
+                            <Font family="SYNC_TO_DEVICE" size="18" color="#B0BEC5">
+                                <Template><![CDATA[%s ago]]><Parameter expression="[COMPLICATION.TITLE]" /></Template>
+                            </Font>
+                        </Text>
+                    </PartText>
+                </Group>
+            </Complication>
+
+            <Complication type="EMPTY">
+                <Group name="glucose_empty" x="0" y="0" width="208" height="96">
+                    <PartText x="0" y="4" width="208" height="60" alpha="255">
+                        <Text align="CENTER">
+                            <Font family="SYNC_TO_DEVICE" size="58" weight="BOLD" color="#90A4AE">
+                                <![CDATA[--]]>
+                            </Font>
+                        </Text>
+                    </PartText>
+
+                    <PartText x="0" y="66" width="208" height="24" alpha="255">
+                        <Text align="CENTER">
+                            <Font family="SYNC_TO_DEVICE" size="18" color="#B0BEC5">
+                                <![CDATA[waiting]]>
+                            </Font>
+                        </Text>
+                    </PartText>
+                </Group>
+            </Complication>
+        </ComplicationSlot>
+    </Scene>
+</WatchFace>

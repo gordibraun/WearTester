@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Dexcom Live Face</string>
+    <string name="glucose_slot_name">Glucose</string>
+</resources>

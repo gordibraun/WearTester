@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WatchFaces>
+    <WatchFace
+        shape="CIRCLE"
+        width="300"
+        height="300"
+        file="@raw/watchface_basic" />
+    <WatchFace
+        shape="CIRCLE"
+        width="450"
+        height="450"
+        file="@raw/watchface" />
+</WatchFaces>

@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">WearTester Relay</string>
+    <string name="notification_listener_name">WearTester glucose relay</string>
+</resources>
+
