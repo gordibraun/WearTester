@@ -71,12 +71,40 @@ object DexcomConfigStore {
     }
 
     fun save(context: Context, config: DexcomConfig) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit()
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val previousTransmitter = prefs.getString(KEY_TRANSMITTER_ID, "")?.trim()?.uppercase().orEmpty()
+        val previousSensor = prefs.getString(KEY_SENSOR_CODE, "")?.trim()?.uppercase().orEmpty()
+        val nextTransmitter = config.transmitterId.trim().uppercase()
+        val nextSensor = config.sensorCode.trim().uppercase()
+        val configChanged = prefs.contains(KEY_TRANSMITTER_ID) &&
+            (previousTransmitter != nextTransmitter || previousSensor != nextSensor)
+
+        prefs.edit()
             .putString(KEY_TRANSMITTER_ID, config.transmitterId.trim().uppercase())
             .putString(KEY_SENSOR_CODE, config.sensorCode.trim().uppercase())
             .putString(KEY_KNOWN_MAC, config.knownMac.trim().uppercase())
+            .apply {
+                if (configChanged) {
+                    remove(KEY_GLUCOSE_MGDL)
+                    remove(KEY_GLUCOSE_RECEIVED_AT_MILLIS)
+                    remove(KEY_GLUCOSE_DEX_TIMESTAMP)
+                    remove(KEY_GLUCOSE_AGE_SECONDS)
+                    remove(KEY_GLUCOSE_SOURCE)
+                    remove(KEY_DIRECT_GLUCOSE_MGDL)
+                    remove(KEY_DIRECT_GLUCOSE_RECEIVED_AT_MILLIS)
+                    remove(KEY_DIRECT_GLUCOSE_DEX_TIMESTAMP)
+                    remove(KEY_DIRECT_GLUCOSE_AGE_SECONDS)
+                    remove(KEY_DIRECT_GLUCOSE_SOURCE)
+                }
+            }
             .apply()
+        if (configChanged) {
+            appendEvent(
+                prefs,
+                System.currentTimeMillis(),
+                "config changed $previousTransmitter/$previousSensor -> $nextTransmitter/$nextSensor; cleared stale glucose",
+            )
+        }
     }
 
     fun cacheDetectedMac(context: Context, mac: String) {
@@ -143,7 +171,7 @@ object DexcomConfigStore {
     ): GlucoseReadingState {
         val mgdl = if (prefs.contains(KEY_GLUCOSE_MGDL)) prefs.getInt(KEY_GLUCOSE_MGDL, 0) else null
         return GlucoseReadingState(
-            mgdl = mgdl,
+            mgdl = mgdl?.takeIf { it in 20..600 },
             receivedAtMillis = prefs.getLong(KEY_GLUCOSE_RECEIVED_AT_MILLIS, 0L),
             dexTimestamp = prefs.getInt(KEY_GLUCOSE_DEX_TIMESTAMP, 0),
             ageSeconds = prefs.getInt(KEY_GLUCOSE_AGE_SECONDS, 0),
@@ -155,6 +183,7 @@ object DexcomConfigStore {
         prefs: android.content.SharedPreferences,
     ): GlucoseReadingState? {
         if (!prefs.contains(KEY_DIRECT_GLUCOSE_MGDL)) return null
+        if (prefs.getInt(KEY_DIRECT_GLUCOSE_MGDL, 0) !in 20..600) return null
         return GlucoseReadingState(
             mgdl = prefs.getInt(KEY_DIRECT_GLUCOSE_MGDL, 0),
             receivedAtMillis = prefs.getLong(KEY_DIRECT_GLUCOSE_RECEIVED_AT_MILLIS, 0L),
@@ -190,6 +219,7 @@ object DexcomConfigStore {
             }
             .apply()
         appendEvent(prefs, now, lastEvent)
+        ConnectionJournal.record(context, "sensor_event", "detail" to lastEvent.take(220), "rssi" to seenRssi)
     }
 
     fun saveGlucose(
@@ -215,7 +245,11 @@ object DexcomConfigStore {
         ageSeconds: Int,
         source: String,
     ): GlucoseReadingState {
+        require(mgdl in 20..600) { "Sensor status code is not glucose" }
         val receivedAtMillis = System.currentTimeMillis()
+        val previous = loadDirectGlucose(context).receivedAtMillis
+        ConnectionJournal.record(context, "sensor_reading", "gap_ms" to (receivedAtMillis - previous).takeIf { previous > 0 },
+            "sample_age_seconds" to ageSeconds)
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit()
             .putInt(KEY_DIRECT_GLUCOSE_MGDL, mgdl)

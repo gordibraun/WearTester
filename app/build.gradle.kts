@@ -11,10 +11,11 @@ android {
         applicationId = "com.example.weartester"
         minSdk = 30
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 10
+        versionName = "1.9"
 
     }
+    sourceSets.getByName("main").java.srcDir("../shared/src/main/java")
 
     buildTypes {
         release {
@@ -35,6 +36,7 @@ android {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
 
     implementation(libs.play.services.wearable)
     implementation(libs.androidx.watchface)

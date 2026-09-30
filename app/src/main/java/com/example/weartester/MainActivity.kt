@@ -18,6 +18,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import androidx.core.content.ContextCompat
 
@@ -31,6 +32,7 @@ class MainActivity : Activity() {
     private lateinit var transmitterInput: FieldInput
     private lateinit var sensorInput: FieldInput
     private val uiHandler = Handler(Looper.getMainLooper())
+    private val endPairingAttention = Runnable { clearPairingAttention() }
     private val refreshTicker = object : Runnable {
         override fun run() {
             refreshStatus()
@@ -41,7 +43,6 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Log.d(TAG, "onCreate: before setContentView")
-        prepareWindowForPairingAttention()
         setContentView(R.layout.activity_main)
         Log.d(TAG, "onCreate: after setContentView")
 
@@ -52,6 +53,29 @@ class MainActivity : Activity() {
         sensorCodeField = findViewById(R.id.sensorCodeField)
         statusView = findViewById(R.id.statusView)
         Log.d(TAG, "onCreate: view binding complete")
+
+        val controls = Button(this).apply {
+            text = "Еда, инсулин, нагрузка"
+            isAllCaps = false
+            setOnClickListener {
+                val launch = Intent().setClassName("info.nightscout.androidaps", "app.aaps.wear.interaction.menus.MainMenuActivity")
+                if (launch.resolveActivity(packageManager) != null) startActivity(launch)
+                else android.widget.Toast.makeText(this@MainActivity, "Нужно приложение AAPS на часах", android.widget.Toast.LENGTH_LONG).show()
+            }
+        }
+        rootContainer.addView(controls, 1)
+        rootContainer.addView(Button(this).apply {
+            text = "Связь"; isAllCaps = false
+            setOnClickListener {
+                ConnectionMonitor.tick(this@MainActivity)
+                AlertDialog.Builder(this@MainActivity).setTitle("Связь")
+                    .setMessage(ConnectionMonitor.status(this@MainActivity) + "\n\n" + OnePlusPowerCompatibility.status(this@MainActivity)
+                        + "\n\n" + BluetoothIncidentRecorder.status(this@MainActivity))
+                    .setNeutralButton("Питание") { _, _ -> showPowerCompatibility() }
+                    .setNegativeButton("Снимок") { _, _ -> BluetoothIncidentRecorder.capture(this@MainActivity, "manual") }
+                    .setPositiveButton("ОК", null).show()
+            }
+        }, 2)
 
         configureWearInput()
 
@@ -110,7 +134,6 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         Log.d(TAG, "onResume")
-        prepareWindowForPairingAttention()
         refreshStatus()
         uiHandler.removeCallbacks(refreshTicker)
         uiHandler.post(refreshTicker)
@@ -118,7 +141,14 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         uiHandler.removeCallbacks(refreshTicker)
+        clearPairingAttention()
         super.onPause()
+    }
+
+    override fun onDestroy() {
+        uiHandler.removeCallbacks(refreshTicker)
+        uiHandler.removeCallbacks(endPairingAttention)
+        super.onDestroy()
     }
 
     override fun onRequestPermissionsResult(
@@ -156,6 +186,67 @@ class MainActivity : Activity() {
         val config = DexcomConfigStore.load(this)
         transmitterField.setText(config.transmitterId)
         sensorCodeField.setText(config.sensorCode)
+    }
+
+    private fun showPowerCompatibility() {
+        fun statusText() = when {
+            !OnePlusPowerCompatibility.isSupported() -> "Эта прошивка не проверена"
+            !OnePlusPowerCompatibility.hasPermission(this) -> "Для включения требуется разрешение DUMP через ADB"
+            else -> OnePlusPowerCompatibility.status(this)
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val padding = (12 * resources.displayMetrics.density).toInt()
+            setPadding(padding, padding, padding, padding)
+        }
+        val toggle = Switch(this).apply {
+            text = "Совместимость OnePlus"
+            isChecked = OnePlusPowerCompatibility.isEnabled(this@MainActivity)
+        }
+        val status = TextView(this).apply {
+            text = statusText()
+            textSize = 14f
+        }
+        content.addView(toggle)
+        content.addView(status)
+        var updating = false
+        toggle.setOnCheckedChangeListener { _, enabled ->
+            if (updating) return@setOnCheckedChangeListener
+            if (!enabled) {
+                OnePlusPowerCompatibility.setEnabled(this, false)
+                status.text = "Возврат системной настройки..."
+            } else {
+                updating = true
+                toggle.isChecked = false
+                updating = false
+                if (!OnePlusPowerCompatibility.isSupported() || !OnePlusPowerCompatibility.hasPermission(this)) {
+                    status.text = if (!OnePlusPowerCompatibility.isSupported()) "Эта прошивка не проверена" else "Сначала требуется разрешение DUMP через ADB"
+                    return@setOnCheckedChangeListener
+                }
+                AlertDialog.Builder(this).setTitle("Системное ограничение")
+                    .setMessage("Снимает ограничение фонового пробуждения для всех приложений OnePlus. Экран не включается, но батарея может расходоваться быстрее. Режим повторно применяется при запуске сборщика, включая перезагрузку часов.")
+                    .setPositiveButton("Включить") { _, _ ->
+                        OnePlusPowerCompatibility.setEnabled(this, true)
+                        updating = true
+                        toggle.isChecked = OnePlusPowerCompatibility.isEnabled(this)
+                        updating = false
+                        status.text = "Проверка системной настройки..."
+                    }
+                    .setNegativeButton("Отмена", null).show()
+            }
+        }
+        val dialog = AlertDialog.Builder(this).setTitle("Фоновая работа")
+            .setView(ScrollView(this).apply { addView(content) }).setPositiveButton("ОК", null).create()
+        val refresh = object : Runnable {
+            override fun run() {
+                if (!dialog.isShowing) return
+                status.text = statusText()
+                uiHandler.postDelayed(this, 1_000L)
+            }
+        }
+        dialog.setOnDismissListener { uiHandler.removeCallbacks(refresh) }
+        dialog.show()
+        uiHandler.postDelayed(refresh, 1_000L)
     }
 
     private fun configureWearInput() {
@@ -281,7 +372,13 @@ class MainActivity : Activity() {
     }
 
     private fun handleIntentAction(intent: Intent) {
+        if (intent.getBooleanExtra("bluetooth_diagnostic_snapshot", false)) {
+            intent.removeExtra("bluetooth_diagnostic_snapshot")
+            BluetoothIncidentRecorder.capture(this, "manual")
+        }
         if (intent.getBooleanExtra(EXTRA_FORCE_PAIRING_ATTENTION, false)) {
+            intent.removeExtra(EXTRA_FORCE_PAIRING_ATTENTION)
+            prepareWindowForPairingAttention()
             val deviceName = intent.getStringExtra("pairing_device_name").orEmpty()
             val deviceMac = intent.getStringExtra("pairing_device_mac").orEmpty()
             val label = listOf("ПОДТВЕРДИТЕ PAIRING СЕЙЧАС", deviceName.ifBlank { null }, deviceMac.ifBlank { null })
@@ -309,6 +406,23 @@ class MainActivity : Activity() {
             )
         }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        uiHandler.removeCallbacks(endPairingAttention)
+        uiHandler.postDelayed(endPairingAttention, 60_000L)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun clearPairingAttention() {
+        uiHandler.removeCallbacks(endPairingAttention)
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(false)
+            setTurnScreenOn(false)
+        } else {
+            window.clearFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON,
+            )
+        }
     }
 
     private fun refreshStatus(prefix: String? = null) {
@@ -337,6 +451,7 @@ class MainActivity : Activity() {
                 scanDebug.lastEvent.ifBlank { getString(R.string.status_empty_value) },
             ),
             buildGlucoseLine(glucose),
+            SensorSessionStore.load(this).label(System.currentTimeMillis()).text,
             buildDexcomTimerLine(scanDebug),
             permissionStatus,
         )

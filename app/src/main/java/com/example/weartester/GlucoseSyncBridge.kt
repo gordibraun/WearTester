@@ -54,6 +54,7 @@ object GlucoseSyncBridge {
             .put(KEY_DEX_TIMESTAMP, reading.dexTimestamp)
             .put(KEY_AGE_SECONDS, reading.ageSeconds)
             .put(KEY_SOURCE, source)
+            .put("sentAt", System.currentTimeMillis())
             .put(KEY_TRANSMITTER_ID, transmitterId)
             .toString()
             .toByteArray(Charsets.UTF_8)
@@ -65,9 +66,11 @@ object GlucoseSyncBridge {
                         .sendMessage(node.id, PATH_WATCH_GLUCOSE, payload)
                         .addOnSuccessListener {
                             Log.i(TAG, "Watch glucose message sent to ${node.displayName}: $mgdl")
+                            ConnectionJournal.record(context, "glucose_message_queued", "reading_at" to readingAt)
                         }
                         .addOnFailureListener {
                             Log.w(TAG, "Failed to send watch glucose message to ${node.displayName}", it)
+                            ConnectionJournal.record(context, "glucose_message_failed", "error" to it.javaClass.simpleName)
                         }
                 }
             }

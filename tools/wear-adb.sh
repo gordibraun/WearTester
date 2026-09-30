@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WATCH_ID=${WATCH_ID:-H631104000081G1A00V2}
+# Set WATCH_ID to your watch's adb serial (see: adb devices -l).
+WATCH_ID=${WATCH_ID:?Set WATCH_ID to the watch adb serial}
 PACKAGE=${PACKAGE:-com.example.weartester}
 ADB=${ADB:-adb}
 APK=${APK:-app/build/outputs/apk/debug/app-debug.apk}
@@ -101,7 +102,7 @@ endpoint_from_lookup() {
 }
 
 endpoints_from_adb_mdns() {
-  "$ADB" mdns services 2>/dev/null | awk -v id="$WATCH_ID" '$0 ~ id && $NF ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/ {print $NF}' || true
+  "$ADB" mdns services 2>/dev/null | awk -v id="$WATCH_ID" '$0 ~ id && $(NF-1)=="_adb-tls-connect._tcp" && $NF ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/ {print $NF}' || true
 }
 
 endpoints_from_dns_sd() {
@@ -123,19 +124,10 @@ endpoints_from_dns_sd() {
 
 candidate_endpoints() {
   [ -f "$SERIAL_FILE" ] && cat "$SERIAL_FILE" || true
-  printf '%s\n' \
-    "192.168.16.223:5555" \
-    "192.168.16.182:5555"
 }
 
 discovered_endpoints() {
-  endpoints_from_adb_mdns
   endpoints_from_dns_sd
-  printf '%s\n' \
-    "192.168.0.134:5555" \
-    "192.168.10.171:5555" \
-    "192.168.0.134:32921" \
-    "192.168.10.171:36475"
 }
 
 is_device() {
@@ -193,13 +185,19 @@ connect_watch() {
     if connect_one "$endpoint"; then
       return 0
     fi
-  done < <(discovered_endpoints | awk 'NF && !seen[$0]++')
+  done < <(endpoints_from_adb_mdns | awk 'NF && !seen[$0]++')
   while IFS= read -r endpoint; do
     [ -n "$endpoint" ] || continue
     if connect_one "$endpoint"; then
       return 0
     fi
   done < <(candidate_endpoints | awk 'NF && !seen[$0]++')
+  while IFS= read -r endpoint; do
+    [ -n "$endpoint" ] || continue
+    if connect_one "$endpoint"; then
+      return 0
+    fi
+  done < <(discovered_endpoints | awk 'NF && !seen[$0]++')
   return 1
 }
 
@@ -264,14 +262,26 @@ repair() {
   local serial
   serial=$(connect_watch) || { log "watch is not reachable"; return 1; }
   log "repair settings on $serial"
-  "$ADB" -s "$serial" shell 'settings put global development_settings_enabled 1; settings put global adb_enabled 1; settings put global adb_wifi_enabled 1; settings put global adb_allowed_connection_time 0; settings put global wifi_sleep_policy 2; settings put global stay_on_while_plugged_in 15; svc wifi enable; svc power stayon true; cmd deviceidle whitelist +com.example.weartester; cmd appops set com.example.weartester RUN_IN_BACKGROUND allow; cmd appops set com.example.weartester RUN_ANY_IN_BACKGROUND allow; cmd appops set com.example.weartester WAKE_LOCK allow; cmd appops set com.example.weartester START_FOREGROUND allow; echo OK; getprop service.adb.tcp.port; settings get global adb_wifi_enabled; settings get global adb_allowed_connection_time; settings get global wifi_sleep_policy; cmd deviceidle whitelist | grep com.example.weartester || true'
-  if [[ "$serial" != *:5555 ]]; then
-    log "switching adbd to tcpip 5555"
-    "$ADB" -s "$serial" tcpip 5555 || true
-    sleep 3
-    local ip=${serial%:*}
-    connect_one "$ip:5555" >/dev/null || true
-  fi
+  local setting key value op
+  for setting in \
+    'development_settings_enabled 1' 'adb_enabled 1' 'adb_wifi_enabled 1' \
+    'adb_allowed_connection_time 0' 'wifi_always_requested 1' \
+    'wifi_sleep_policy 2' 'stay_on_while_plugged_in 0'; do
+    read -r key value <<<"$setting"
+    "$ADB" -s "$serial" shell settings put global "$key" "$value"
+  done
+  "$ADB" -s "$serial" shell svc wifi enable
+  "$ADB" -s "$serial" shell svc power stayon false
+  # Android 14 otherwise converts HIGH_PERF into a screen-on-only LOW_LATENCY lock.
+  "$ADB" -s "$serial" shell device_config put wifi high_perf_lock_deprecated false
+  "$ADB" -s "$serial" shell cmd deviceidle whitelist +com.example.weartester
+  for op in RUN_IN_BACKGROUND RUN_ANY_IN_BACKGROUND WAKE_LOCK START_FOREGROUND; do
+    "$ADB" -s "$serial" shell cmd appops set com.example.weartester "$op" allow
+  done
+  # Retain paired TLS ADB; do not replace it with the legacy TCP listener.
+  "$ADB" -s "$serial" shell settings get global wifi_always_requested
+  "$ADB" -s "$serial" shell settings get global adb_wifi_enabled
+  "$ADB" -s "$serial" shell device_config get wifi high_perf_lock_deprecated
   adb_devices
 }
 
@@ -302,7 +312,7 @@ Commands:
   events         print persisted app event log
   logs [N]       print last N BondProbe logcat lines
   install        install debug APK and restart app
-  repair         re-apply watch debug/Doze settings and prefer tcpip 5555
+  repair         retain Wi-Fi requests and paired TLS debugging without keeping screen on
   monitor [SEC]  loop prefs with reconnect, one ADB command at a time
   shell ...      run adb shell via discovered watch serial
 USAGE

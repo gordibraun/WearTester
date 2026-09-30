@@ -37,15 +37,19 @@ class DexcomGlucoseComplicationService : ComplicationDataSourceService() {
             DexcomConfigStore.loadGlucose(this)
         }
         val nowMillis = System.currentTimeMillis()
+        val session = SensorSessionStore.load(this)
+        val unusable = !preview && session.lastContactAt >= glucose.receivedAtMillis && session.state !in setOf(0, 6, 7)
         val ageMinutes = ElapsedTimeFormatter.elapsedMinutes(glucose.receivedAtMillis, nowMillis)
         val stale = !preview && glucose.mgdl != null && ageMinutes >= STALE_AFTER_MINUTES
         val compactAge = ElapsedTimeFormatter.compactMinutes(glucose.receivedAtMillis, nowMillis)
         val shortText = when {
+            unusable -> "--"
             stale -> "OLD"
             glucose.mgdl != null -> glucose.mgdl.toString()
             else -> "--"
         }
         val titleText: ComplicationText = when {
+            unusable -> PlainComplicationText.Builder(session.glucoseStatus()).build()
             ageMinutes >= 0 -> TimeDifferenceComplicationText.Builder(
                 TimeDifferenceStyle.SHORT_SINGLE_UNIT,
                 CountUpTimeReference(Instant.ofEpochMilli(glucose.receivedAtMillis)),
@@ -55,7 +59,9 @@ class DexcomGlucoseComplicationService : ComplicationDataSourceService() {
             stale -> PlainComplicationText.Builder("${glucose.mgdl} $compactAge").build()
             else -> PlainComplicationText.Builder("Dex").build()
         }
-        val description = if (stale) {
+        val description = if (unusable) {
+            session.glucoseStatus()
+        } else if (stale) {
             "Устаревшая глюкоза ${glucose.mgdl}, $compactAge назад"
         } else if (glucose.mgdl != null) {
             "Глюкоза ${glucose.mgdl} миллиграмм на децилитр"
@@ -92,6 +98,7 @@ class DexcomGlucoseComplicationService : ComplicationDataSourceService() {
         private const val STALE_AFTER_MINUTES = 10L
 
         fun requestImmediateUpdate(context: android.content.Context) {
+            runCatching { SensorExpiryComplicationService.requestUpdate(context) }
             runCatching {
                 androidx.wear.watchface.complications.datasource.ComplicationDataSourceUpdateRequester
                     .create(

@@ -33,9 +33,11 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
+import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.google.android.gms.wearable.DataClient
@@ -76,7 +78,6 @@ class BondProbeService : Service() {
         private const val READING_WINDOW_ALARM_SHOW_REQUEST_CODE = 1043
         private const val NAME_PREFIX = "Dexcom"
         private const val SCAN_MS = 480_000L
-        private const val SCAN_RESTART_MS = 4 * 60_000L
         private const val BLE_RECOVERY_SETTLE_MS = 1_500L
         private const val SCAN_FAILED_RECOVERY_RETRY_DELAY_MS = 2_000L
         private const val SCANNER_STOP_START_SETTLE_MS = 250L
@@ -85,7 +86,7 @@ class BondProbeService : Service() {
         private const val MIN_CONNECTABLE_DEXCOM_RSSI = -98
         private const val POST_GATT_FAILURE_MIN_CONNECT_RSSI = -94
         private const val POST_GATT_FAILURE_WEAK_FALLBACK_RSSI = -95
-        private const val CONNECT_ATTEMPT_TIMEOUT_MS = 75_000L
+        private const val CONNECT_ATTEMPT_TIMEOUT_MS = GattTimeoutPolicy.ADVERTISED_CONNECT_TIMEOUT_MS
         private const val AUTOCONNECT_ATTEMPT_TIMEOUT_MS = 6 * 60_000L
         private const val RECONNECT_DELAY_MS = 15_000L
         private const val COMPLICATION_REFRESH_MS = 60_000L
@@ -111,7 +112,6 @@ class BondProbeService : Service() {
         private const val STALE_AUTOCONNECT_AFTER_GATT_FAILURES = 2
         private const val SILENT_BROAD_SCAN_DIRECT_RESTARTS = 2
         private const val SILENT_BROAD_SCAN_DIRECT_TIMEOUT_MS = 18_000L
-        private const val WATCHDOG_STALE_CONNECT_GRACE_MS = 5_000L
         private const val WATCHDOG_CONNECTED_WITHOUT_GLUCOSE_MS = 45_000L
         private const val WATCHDOG_ACTIVE_GATT_HARD_MS = 95_000L
         private const val KNOWN_MAC_AUTOCONNECT_AFTER_NO_ADV_MS = 2 * 60_000L
@@ -125,10 +125,7 @@ class BondProbeService : Service() {
         private const val CONNECTED_SESSION_WITHOUT_GLUCOSE_TIMEOUT_MS = 120_000L
         private const val CONNECTED_SENSOR_REFRESH_MS = DEXCOM_READING_PERIOD_MS + 2_000L
         private const val CONNECTED_SENSOR_REFRESH_RETRY_MS = 12_000L
-        private const val PRE_WINDOW_DIRECT_CONNECT_START_MS = 3 * 60_000L + 35_000L
-        private const val PRE_WINDOW_DIRECT_CONNECT_AFTER_BOUNDARY_MS = 115_000L
-        private const val PRE_WINDOW_DIRECT_CONNECT_RETRY_MS = 35_000L
-        private const val PRE_WINDOW_DIRECT_CONNECT_TIMEOUT_MS = 40_000L
+        private const val DEXCOM_TIMESTAMP_RESET_ACCEPT_SECONDS = 60 * 60
         private const val POST_GLUCOSE_DUPLICATE_SUPPRESSION_MS = 2 * 60_000L
         private const val BROAD_SCAN_SILENT_RESTART_MS = 25_000L
         private const val COLLECTOR_WAKE_LOCK_TIMEOUT_MS = 6 * 60_000L
@@ -152,8 +149,12 @@ class BondProbeService : Service() {
         getSystemService(BluetoothManager::class.java)?.adapter
     }
     private var scanner: BluetoothLeScanner? = null
-    private var scanning = false
-    private var gatt: BluetoothGatt? = null
+    @Volatile private var scanning = false
+    private val gattLock = Any()
+    private val gattRetryPolicy = GattRetryPolicy()
+    private var gattRetryWaitLogged = false
+    @Volatile private var gatt: BluetoothGatt? = null
+    private val collectorStartedAt = System.currentTimeMillis()
     @Volatile private var wantConnected = true
     @Volatile private var config: DexcomConfig = DexcomConfig("", "", "")
     private val worker: ExecutorService = Executors.newSingleThreadExecutor()
@@ -173,7 +174,7 @@ class BondProbeService : Service() {
     @Volatile private var directMacFailures = 0
     @Volatile private var earlyGattFailureCount = 0
     @Volatile private var preferScanUntilMillis = 0L
-    @Volatile private var lastSuccessfulGlucoseAtMillis = 0L
+    @Volatile private var lastSensorContactAtMillis = 0L
     @Volatile private var waitingBondConfirmation = 0
     @Volatile private var keepAliveInFlight = false
     @Volatile private var localBondAuthRetryCount = 0
@@ -183,15 +184,18 @@ class BondProbeService : Service() {
     @Volatile private var sessionStartSent = false
     @Volatile private var lastSensorRequestAtMillis = 0L
     @Volatile private var gattConnectStartedAtMillis = 0L
+    @Volatile private var gattAttemptCreatedAtMillis = 0L
+    @Volatile private var gattAttemptCreatedAtElapsed = 0L
+    @Volatile private var gattConnectedAtElapsed = 0L
     @Volatile private var gattConnectedAtMillis = 0L
     @Volatile private var currentGattConnectTimeoutMs = CONNECT_ATTEMPT_TIMEOUT_MS
     @Volatile private var lastComplicationRefreshAtMillis = 0L
     @Volatile private var lastPhoneRelayPullAtMillis = 0L
     @Volatile private var lastNonMatchDebugAtMillis = 0L
     @Volatile private var lastDirectRecoveryAttemptAtMillis = 0L
-    @Volatile private var lastPreWindowScanPreserveAtMillis = 0L
     @Volatile private var lastDexcomAdvertisementAtMillis = 0L
     @Volatile private var lastScanStartedAtMillis = 0L
+    @Volatile private var lastScanStartedAtElapsed = 0L
     @Volatile private var lastAnyScanCallbackAtMillis = 0L
     @Volatile private var consecutiveSilentBroadScanRestarts = 0
     @Volatile private var forceBroadScanUntilMillis = 0L
@@ -239,8 +243,9 @@ class BondProbeService : Service() {
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "onCreate")
+        ConnectionJournal.record(this, "collector_created")
         config = DexcomConfigStore.load(this)
-        lastSuccessfulGlucoseAtMillis = DexcomConfigStore.loadDirectGlucose(this).receivedAtMillis
+        lastSensorContactAtMillis = maxOf(DexcomConfigStore.loadDirectGlucose(this).receivedAtMillis, SensorSessionStore.load(this).lastContactAt)
         DexcomConfigStore.saveScanDebug(this, "", "", null, "service created")
         ensureNotifChannel()
         ensureCollectorWakeLock("service created")
@@ -253,6 +258,7 @@ class BondProbeService : Service() {
         }
         maybePrepareStaleStartupRecovery()
         startForegroundWithNotification(buildStartupText())
+        OnePlusPowerCompatibility.collectorStarted(this)
         requestComplicationRefresh("service created", force = true)
         if (PhoneGlucoseRelayService.ENABLED) {
             maybePullPhoneRelay("service created", force = true)
@@ -264,7 +270,7 @@ class BondProbeService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         config = DexcomConfigStore.load(this)
-        lastSuccessfulGlucoseAtMillis = maxOf(lastSuccessfulGlucoseAtMillis, DexcomConfigStore.loadDirectGlucose(this).receivedAtMillis)
+        lastSensorContactAtMillis = maxOf(lastSensorContactAtMillis, DexcomConfigStore.loadDirectGlucose(this).receivedAtMillis)
         ensureCollectorWakeLock("service start")
         ensureDebugWifiLock("service start")
         if (intent?.action == ACTION_READING_WINDOW_WAKE) {
@@ -296,9 +302,11 @@ class BondProbeService : Service() {
         releaseCollectorWakeLock()
         releaseReadingWindowWakeLock("service destroy")
         releaseDebugWifiLock("service destroy")
+        OnePlusPowerCompatibility.collectorStopped(this)
         cancelReadingWindowAlarm()
         super.onDestroy()
         Log.i(TAG, "onDestroy")
+        ConnectionJournal.record(this, "collector_destroyed")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -452,6 +460,9 @@ class BondProbeService : Service() {
             if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
             val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
             val previous = intent.getIntExtra(BluetoothAdapter.EXTRA_PREVIOUS_STATE, BluetoothAdapter.ERROR)
+            if (state == BluetoothAdapter.STATE_OFF) {
+                BluetoothIncidentRecorder.capture(this@BondProbeService, "adapter_off", "previous_state" to previous)
+            }
             Log.w(TAG, "Bluetooth adapter state changed prev=$previous state=$state")
             DexcomConfigStore.saveScanDebug(
                 this@BondProbeService,
@@ -678,17 +689,21 @@ class BondProbeService : Service() {
         collectorWakeLock = null
     }
 
+    @Synchronized
+    @Suppress("DEPRECATION")
     private fun ensureDebugWifiLock(reason: String) {
-        if (!DEBUG_WIFI_KEEPALIVE_ENABLED) return
         try {
-            val wifiManager = applicationContext.getSystemService(WifiManager::class.java) ?: return
-            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-            } else {
-                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            if (!wantConnected || !DEBUG_WIFI_KEEPALIVE_ENABLED ||
+                Settings.Global.getInt(contentResolver, "adb_wifi_enabled", 0) != 1
+            ) {
+                releaseDebugWifiLock("wireless debugging disabled")
+                return
             }
+            val wifiManager = applicationContext.getSystemService(WifiManager::class.java) ?: return
+            // LOW_LATENCY is inactive with the screen off. On Android 14 the device also
+            // needs wifi/high_perf_lock_deprecated=false, set explicitly through ADB.
             val wifiLock = debugWifiLock ?: wifiManager.createWifiLock(
-                mode,
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF,
                 "WearTester:debug-wifi",
             ).apply {
                 setReferenceCounted(false)
@@ -696,18 +711,21 @@ class BondProbeService : Service() {
             }
             if (!wifiLock.isHeld) {
                 wifiLock.acquire()
-                Log.i(TAG, "debug Wi-Fi lock acquired ($reason)")
+                ConnectionJournal.record(this, "debug_wifi_lock_requested", "mode" to "high_perf", "reason" to reason)
+                Log.i(TAG, "debug Wi-Fi high-perf lock requested ($reason); effective mode requires system verification")
             }
         } catch (t: Throwable) {
             Log.w(TAG, "debug Wi-Fi lock failed ($reason): ${t.message}")
         }
     }
 
+    @Synchronized
     private fun releaseDebugWifiLock(reason: String) {
         try {
             debugWifiLock?.let {
                 if (it.isHeld) {
                     it.release()
+                    ConnectionJournal.record(this, "debug_wifi_lock_released", "reason" to reason)
                     Log.i(TAG, "debug Wi-Fi lock released ($reason)")
                 }
             }
@@ -718,7 +736,7 @@ class BondProbeService : Service() {
 
     @Suppress("DEPRECATION")
     private fun maybeEnsureReadingWindowWakeLock(reason: String) {
-        val last = lastSuccessfulGlucoseAtMillis
+        val last = lastSensorContactAtMillis
         if (last <= 0L) return
         val now = System.currentTimeMillis()
         val age = now - last
@@ -773,7 +791,7 @@ class BondProbeService : Service() {
     }
 
     private fun scheduleNextReadingWindowAlarm(reason: String) {
-        val last = lastSuccessfulGlucoseAtMillis
+        val last = lastSensorContactAtMillis
         if (last <= 0L) return
         val now = System.currentTimeMillis()
         var triggerAt = last + READING_WINDOW_WAKE_START_MS
@@ -826,22 +844,11 @@ class BondProbeService : Service() {
             cycleAge <= READING_WINDOW_WAKE_AFTER_BOUNDARY_MS
     }
 
-    private fun isDexcomProtectedScanWindow(ageMillis: Long): Boolean {
-        if (ageMillis < BROAD_SCAN_BEFORE_NEXT_READING_MS) return false
-        val cycleAge = ageMillis % DEXCOM_READING_PERIOD_MS
-        return cycleAge >= BROAD_SCAN_BEFORE_NEXT_READING_MS ||
-            cycleAge <= READING_WINDOW_WAKE_AFTER_BOUNDARY_MS
-    }
-
-    private fun isPreWindowDirectConnectWindow(ageMillis: Long): Boolean {
-        if (ageMillis < PRE_WINDOW_DIRECT_CONNECT_START_MS) return false
-        if (ageMillis >= DEXCOM_READING_PERIOD_MS) return false
-        val cycleAge = ageMillis % DEXCOM_READING_PERIOD_MS
-        return cycleAge >= PRE_WINDOW_DIRECT_CONNECT_START_MS
-    }
+    private fun isDexcomProtectedScanWindow(ageMillis: Long): Boolean =
+        RecoveryPolicy.protectedScanWindow(ageMillis)
 
     private fun shouldHonorConnectCooldown(now: Long = System.currentTimeMillis()): Boolean {
-        val last = lastSuccessfulGlucoseAtMillis
+        val last = lastSensorContactAtMillis
         if (last <= 0L) return false
         val age = now - last
         return age in 0 until POST_GLUCOSE_DUPLICATE_SUPPRESSION_MS
@@ -936,11 +943,10 @@ class BondProbeService : Service() {
                     continue
                 }
                 var scanDeadline = System.currentTimeMillis() + SCAN_MS
-                var lastScanRestartAt = System.currentTimeMillis()
                 while (wantConnected) {
                     val loopNow = System.currentTimeMillis()
                     if (loopNow >= scanDeadline) {
-                        val lastGlucoseAt = lastSuccessfulGlucoseAtMillis
+                        val lastGlucoseAt = lastSensorContactAtMillis
                         val age = if (lastGlucoseAt > 0L) loopNow - lastGlucoseAt else 0L
                         val preserveScan =
                             scanning && gatt == null && lastGlucoseAt > 0L &&
@@ -958,87 +964,24 @@ class BondProbeService : Service() {
                         scanDeadline = loopNow + SCAN_MS
                     }
                     if (handlePendingBleSessionRecovery()) {
-                        lastScanRestartAt = System.currentTimeMillis()
                         sleep(SCANNER_STOP_START_SETTLE_MS)
                         continue
                     }
-                    if (handleReadingWindowRefreshRequest()) {
-                        lastScanRestartAt = System.currentTimeMillis()
-                    }
+                    handleReadingWindowRefreshRequest()
                     if (gatt != null) {
                         waitConnectedLoop()
                         if (gatt == null && scanning && wantConnected) {
-                            lastScanRestartAt = System.currentTimeMillis()
                             continue
                         }
                         break
                     }
                     val now = System.currentTimeMillis()
                     maybeEnsureReadingWindowWakeLock("scan loop")
-                    val lastGlucoseAt = lastSuccessfulGlucoseAtMillis
-                    val glucoseAge = if (lastGlucoseAt > 0L) now - lastGlucoseAt else 0L
-                    val glucoseStale = lastGlucoseAt > 0L && glucoseAge >= MISSED_READING_RECOVERY_MS
-                    val inDexcomProtectedScanWindow =
-                        lastGlucoseAt > 0L && isDexcomProtectedScanWindow(glucoseAge)
-                    if (
-                        scanning &&
-                        gatt == null &&
-                        lastGlucoseAt > 0L &&
-                        isPreWindowDirectConnectWindow(glucoseAge) &&
-                        now - lastDirectRecoveryAttemptAtMillis >= PRE_WINDOW_DIRECT_CONNECT_RETRY_MS
-                    ) {
-                        if (currentScanBroad && isBroadRecoveryScanActive()) {
-                            if (now - lastPreWindowScanPreserveAtMillis >= PRE_WINDOW_DIRECT_CONNECT_RETRY_MS) {
-                                lastPreWindowScanPreserveAtMillis = now
-                                Log.i(TAG, "Pre-window broad scan preserved after GATT failure age=${glucoseAge}ms")
-                                DexcomConfigStore.saveScanDebug(
-                                    this,
-                                    "",
-                                    config.knownMac,
-                                    null,
-                                    "pre-window broad scan preserved age=${glucoseAge}ms",
-                                )
-                            }
-                            sleep(1_000)
-                            continue
-                        }
-                        Log.w(TAG, "Pre-window direct Dexcom connect age=${glucoseAge}ms")
-                        DexcomConfigStore.saveScanDebug(
-                            this,
-                            "",
-                            config.knownMac,
-                            null,
-                            "pre-window direct connect age=${glucoseAge}ms",
-                        )
-                        if (
-                            maybeTryBondedDirectRecovery(
-                                "pre-window direct connect age=${glucoseAge}ms",
-                                allowDuringBroadScan = true,
-                                minRetryMs = PRE_WINDOW_DIRECT_CONNECT_RETRY_MS,
-                            )
-                        ) {
-                            lastScanRestartAt = System.currentTimeMillis()
-                            continue
-                        }
-                    }
                     val shouldBroadScan = shouldUseBroadDexcomScan()
                     val needsBroadSwitch = shouldBroadScan && !currentScanBroad
-                    // Keep LOW_LATENCY scan continuous once Dexcom is close or overdue;
-                    // OnePlus Watch 3 can miss the short advertisement after stop/start.
-                    val needsPeriodicRefresh =
-                        !glucoseStale && !inDexcomProtectedScanWindow && now - lastScanRestartAt >= SCAN_RESTART_MS
-                    if (scanning && (needsBroadSwitch || needsPeriodicRefresh)) {
-                        val reason = if (needsBroadSwitch) {
-                            "Switching BLE scan to broad Dexcom recovery mode"
-                        } else {
-                            "Refreshing BLE scan window to avoid stale scanner state"
-                        }
-                        Log.i(TAG, reason)
-                        stopScan()
-                        sleep(SCANNER_STOP_START_SETTLE_MS)
-                        startScanInternal()
-                        lastScanRestartAt = now
-                    }
+                    // Both modes use the same controller filters. Changing the mode needs no BLE restart.
+                    if (scanning && needsBroadSwitch) currentScanBroad = true
+                    refreshScanBeforePlatformTimeout()
                     if (!scanning && gatt == null && btAdapter?.isEnabled == true) {
                         val pendingMatchConnectMs = pendingMatchConnectUntilMillis - now
                         if (pendingMatchConnectMs > 0L) {
@@ -1050,7 +993,6 @@ class BondProbeService : Service() {
                         DexcomConfigStore.saveScanDebug(this, "", config.knownMac, null, "scanner restart inside scan window")
                         sleep(SCAN_FAILED_RECOVERY_RETRY_DELAY_MS)
                         startScanInternal()
-                        lastScanRestartAt = System.currentTimeMillis()
                     }
                     sleep(1_000)
                 }
@@ -1068,30 +1010,11 @@ class BondProbeService : Service() {
     private fun waitConnectedLoop() {
         var count = 0
         while (wantConnected && gatt != null) {
-                if (!servicesDiscovered && gattConnectStartedAtMillis > 0L) {
-                    val connectAge = System.currentTimeMillis() - gattConnectStartedAtMillis
-                    val timeout = currentGattConnectTimeoutMs
-                if (connectAge >= timeout) {
-                    Log.w(TAG, "GATT connect timeout ${connectAge}ms autoConnect=$currentGattAutoConnect without services; restarting scan-first")
-                    enableBroadRecoveryScan("gatt connect timeout ${connectAge}ms")
-                    DexcomConfigStore.saveScanDebug(
-                        this,
-                        "",
-                        config.knownMac,
-                        null,
-                        "gatt connect timeout ${connectAge}ms autoConnect=$currentGattAutoConnect",
-                    )
-                    updateNotif("Таймаут GATT, повторяю поиск Dexcom")
-                    closeGatt("connect timeout ${connectAge}ms")
-                    if (wantConnected && btAdapter?.isEnabled == true && !scanning) {
-                        runCatching { startScanInternal() }
-                    }
-                    break
-                }
-            }
+            val attempt = gatt ?: break
+            if (expireGattPhaseIfNeeded()) break
             val connectedAt = gattConnectedAtMillis
             val connectedGatt = gatt
-            if (connectedAt > 0L && lastSuccessfulGlucoseAtMillis < connectedAt) {
+            if (connectedAt > 0L && lastSensorContactAtMillis < connectedAt) {
                 val connectedAge = System.currentTimeMillis() - connectedAt
                 if (connectedAge >= CONNECTED_SESSION_WITHOUT_GLUCOSE_TIMEOUT_MS) {
                     Log.w(TAG, "Connected for ${connectedAge}ms without glucose; restarting watch-primary Dexcom session")
@@ -1103,7 +1026,7 @@ class BondProbeService : Service() {
                         "restart stale gatt after ${connectedAge}ms without glucose",
                     )
                     setPhoneCollectionCooldown("connected timeout without glucose")
-                    closeGatt("connected timeout without glucose; restart watch collector")
+                    if (!closeGatt("connected timeout without glucose; restart watch collector", attempt)) continue
                     if (wantConnected && btAdapter?.isEnabled == true && !scanning) {
                         runCatching { startScanInternal() }
                     }
@@ -1120,7 +1043,7 @@ class BondProbeService : Service() {
 
     private fun maybeRequestConnectedGlucoseRefresh(connectedGatt: BluetoothGatt) {
         val now = System.currentTimeMillis()
-        val lastGlucoseAt = lastSuccessfulGlucoseAtMillis
+        val lastGlucoseAt = lastSensorContactAtMillis
         if (lastGlucoseAt <= 0L) return
         val connectedAt = gattConnectedAtMillis
         if (!servicesDiscovered || connectedAt <= 0L || lastGlucoseAt <= connectedAt) return
@@ -1151,12 +1074,16 @@ class BondProbeService : Service() {
             sleep(30_000)
             if (!wantConnected) break
             ensureCollectorWakeLock("watchdog")
+            ensureDebugWifiLock("watchdog")
+            OnePlusPowerCompatibility.requestCheck(this)
+            runCatching { ConnectionMonitor.tick(this) }
+                .onFailure { Log.w(TAG, "Connection diagnostic unavailable", it) }
             requestComplicationRefresh("watchdog age tick")
-            lastSuccessfulGlucoseAtMillis = maxOf(
-                lastSuccessfulGlucoseAtMillis,
+            lastSensorContactAtMillis = maxOf(
+                lastSensorContactAtMillis,
                 DexcomConfigStore.loadDirectGlucose(this).receivedAtMillis,
             )
-            val last = lastSuccessfulGlucoseAtMillis
+            val last = lastSensorContactAtMillis
             if (last <= 0L) continue
             val age = System.currentTimeMillis() - last
             if (PhoneGlucoseRelayService.ENABLED) {
@@ -1287,6 +1214,8 @@ class BondProbeService : Service() {
     }
 
     private fun recoverStaleActiveGattFromWatchdog(glucoseAgeMs: Long): Boolean {
+        if (expireGattPhaseIfNeeded()) return true
+        val attempt = gatt ?: return false
         val now = System.currentTimeMillis()
         val connectStartedAt = gattConnectStartedAtMillis
         val connectedAt = gattConnectedAtMillis
@@ -1296,20 +1225,18 @@ class BondProbeService : Service() {
             else -> return false
         }
         val activeAge = now - activeSince
-        val connectTimeout = currentGattConnectTimeoutMs + WATCHDOG_STALE_CONNECT_GRACE_MS
-        val connectStuck = !servicesDiscovered && activeAge >= connectTimeout
         val connectedNoGlucose = servicesDiscovered &&
             connectedAt > 0L &&
-            lastSuccessfulGlucoseAtMillis < connectedAt &&
+            lastSensorContactAtMillis < connectedAt &&
             activeAge >= WATCHDOG_CONNECTED_WITHOUT_GLUCOSE_MS
         val hardStuck = activeAge >= WATCHDOG_ACTIVE_GATT_HARD_MS
-        if (!connectStuck && !connectedNoGlucose && !hardStuck) return false
+        if (!connectedNoGlucose && !hardStuck) return false
 
         val reason = "watchdog stale gatt active=${activeAge}ms glucoseAge=${glucoseAgeMs}ms autoConnect=$currentGattAutoConnect services=$servicesDiscovered"
         Log.w(TAG, "Closing stale active GATT from watchdog: $reason")
         DexcomConfigStore.saveScanDebug(this, "", config.knownMac, null, reason)
         enableBroadRecoveryScan(reason)
-        closeGatt(reason)
+        if (!closeGatt(reason, attempt)) return false
         if (wantConnected && btAdapter?.isEnabled == true && gatt == null) {
             if (
                 maybeTryBondedDirectRecovery(
@@ -1328,7 +1255,34 @@ class BondProbeService : Service() {
         return true
     }
 
-    private fun performMissedReadingRecovery(reason: String) {
+    private fun expireGattPhaseIfNeeded(): Boolean = synchronized(gattLock) {
+        val attempt = gatt ?: return false
+        if (!wantConnected || gattAttemptCreatedAtElapsed <= 0L) return false
+        val now = SystemClock.elapsedRealtime()
+        val attemptAge = now - gattAttemptCreatedAtElapsed
+        val connectedAge = gattConnectedAtElapsed.takeIf { it > 0L }?.let { now - it }
+        val phase = GattTimeoutPolicy.expiredPhase(
+            attemptAge, connectedAge, servicesDiscovered, currentGattConnectTimeoutMs,
+        ) ?: return false
+
+        // Recheck and close under the callback lock: a just-established link must
+        // never be cancelled using the shorter CONNECTING deadline.
+        ConnectionJournal.record(this, "gatt_phase_timeout", "phase" to phase.name,
+            "attempt_ms" to attemptAge, "connected_ms" to connectedAge,
+            "rssi" to currentGattMatchRssi.takeUnless { it == Int.MIN_VALUE })
+        BluetoothIncidentRecorder.capture(this, "gatt_timeout", "phase" to phase.name,
+            "attempt_ms" to attemptAge, "connected_ms" to connectedAge)
+        val reason = "gatt ${phase.name} timeout ${attemptAge}ms"
+        DexcomConfigStore.saveScanDebug(this, "", config.knownMac, null, reason)
+        if (!closeGatt(reason, attempt)) return false
+        // Retry only after a new advertisement, never blindly on the old packet.
+        if (wantConnected && btAdapter?.isEnabled == true && !scanning) startScanInternal()
+        true
+    }
+
+    private fun performMissedReadingRecovery(reason: String): Unit = synchronized(gattLock) {
+        // An advertisement callback may have connected since the watchdog's earlier check.
+        if (gatt != null || !wantConnected) return
         reconnectDelayMs = 2_000L
         directMacFailures = maxOf(directMacFailures, 1)
         preferScanUntilMillis = System.currentTimeMillis() + PREFER_SCAN_AFTER_SUCCESS_MS
@@ -1356,9 +1310,12 @@ class BondProbeService : Service() {
         minRetryMs: Long = DIRECT_RECOVERY_RETRY_MS,
         preferAutoConnect: Boolean = false,
         connectTimeoutMs: Long? = null,
-    ): Boolean {
+    ): Boolean = synchronized(gattLock) {
         val now = System.currentTimeMillis()
+        if (gattRetryPolicy.remainingMs(SystemClock.elapsedRealtime()) > 0L) return false
         if (shouldHonorConnectCooldown(now)) return false
+        val contactAge = now - lastSensorContactAtMillis.takeIf { it > 0L }.let { it ?: collectorStartedAt }
+        if (!RecoveryPolicy.allowBlindProbe(contactAge, now - lastDirectRecoveryAttemptAtMillis)) return false
         if (now - lastDirectRecoveryAttemptAtMillis < minRetryMs) return false
         if (!allowDuringBroadScan && scanning && now - lastBroadRecoveryStartedAtMillis < BROAD_RECOVERY_SCAN_MS) return false
         val knownMac = config.knownMac
@@ -1374,11 +1331,7 @@ class BondProbeService : Service() {
         Log.w(TAG, "Missed-reading recovery: trying bonded $mode ${fallbackDevice.address} ($reason)")
         DexcomConfigStore.saveScanDebug(this, "", fallbackDevice.address, null, "stale $mode: $reason")
         runCatching { stopScan() }
-        val timeout = connectTimeoutMs ?: when {
-            useAutoConnect -> STALE_AUTOCONNECT_TIMEOUT_MS
-            allowDuringBroadScan -> PRE_WINDOW_DIRECT_CONNECT_TIMEOUT_MS
-            else -> CONNECT_ATTEMPT_TIMEOUT_MS
-        }
+        val timeout = minOf(connectTimeoutMs ?: RecoveryPolicy.BLIND_PROBE_TIMEOUT, RecoveryPolicy.BLIND_PROBE_TIMEOUT)
         return connectGatt(
             device = fallbackDevice,
             connectTimeoutMs = timeout,
@@ -1396,7 +1349,7 @@ class BondProbeService : Service() {
 
     private fun maybePrepareStaleStartupRecovery() {
         val knownMac = config.knownMac
-        val lastGlucoseAt = lastSuccessfulGlucoseAtMillis
+        val lastGlucoseAt = lastSensorContactAtMillis
         if (knownMac.isBlank() || lastGlucoseAt <= 0L) return
         val age = System.currentTimeMillis() - lastGlucoseAt
         if (age < STALE_STARTUP_REBOND_MS) return
@@ -1422,10 +1375,10 @@ class BondProbeService : Service() {
         return System.currentTimeMillis() < forceBroadScanUntilMillis
     }
 
-    private fun restartSilentBroadScanIfNeeded(now: Long, glucoseAge: Long): Boolean {
+    private fun restartSilentBroadScanIfNeeded(now: Long, glucoseAge: Long): Boolean = synchronized(gattLock) {
         if (!scanning || !currentScanBroad || gatt != null || btAdapter?.isEnabled != true) return false
         val lastActivity = maxOf(lastAnyScanCallbackAtMillis, lastScanStartedAtMillis)
-        if (lastActivity <= 0L || now - lastActivity < BROAD_SCAN_SILENT_RESTART_MS) return false
+        if (lastActivity <= 0L || !RecoveryPolicy.allowSilentScanRestart(glucoseAge, now - lastActivity)) return false
 
         Log.w(TAG, "Broad scan silent for ${now - lastActivity}ms while stale ${glucoseAge}ms; restarting BLE scan")
         consecutiveSilentBroadScanRestarts += 1
@@ -1446,7 +1399,7 @@ class BondProbeService : Service() {
     }
 
     private fun shouldUseBroadNearReadingWindow(): Boolean {
-        val last = lastSuccessfulGlucoseAtMillis
+        val last = lastSensorContactAtMillis
         return last > 0L && System.currentTimeMillis() - last >= BROAD_SCAN_BEFORE_NEXT_READING_MS
     }
 
@@ -1488,7 +1441,9 @@ class BondProbeService : Service() {
         connectTimeoutMs: Long = CONNECT_ATTEMPT_TIMEOUT_MS,
         matchRssi: Int = Int.MIN_VALUE,
         autoConnectOverride: Boolean? = null,
-    ): Boolean {
+    ): Boolean = synchronized(gattLock) {
+        if (gatt != null || !wantConnected) return false
+        if (gattRetryPolicy.remainingMs(SystemClock.elapsedRealtime()) > 0L) return false
         ensureCollectorWakeLock("connect gatt")
         closeGatt("before new connect")
         bondFlowStarted = false
@@ -1496,6 +1451,7 @@ class BondProbeService : Service() {
         servicesDiscovered = false
         gattConnectStartedAtMillis = 0L
         gattConnectedAtMillis = 0L
+        gattConnectedAtElapsed = 0L
         val autoConnect = autoConnectOverride ?: shouldUseGattAutoConnect()
         currentGattAutoConnect = autoConnect
         currentGattConnectTimeoutMs = connectTimeoutMs
@@ -1509,6 +1465,8 @@ class BondProbeService : Service() {
         updateNotif("Подключение к ${device.address}…")
         return try {
             gattConnectStartedAtMillis = System.currentTimeMillis()
+            gattAttemptCreatedAtMillis = gattConnectStartedAtMillis
+            gattAttemptCreatedAtElapsed = SystemClock.elapsedRealtime()
             gatt = device.connectGatt(
                 this,
                 autoConnect,
@@ -1516,6 +1474,9 @@ class BondProbeService : Service() {
                 BluetoothDevice.TRANSPORT_LE,
             )
             Log.i(TAG, "connectGatt issued autoConnect=$autoConnect timeout=${connectTimeoutMs}ms")
+            ConnectionJournal.record(this, "gatt_attempt", "source" to if (matchRssi == Int.MIN_VALUE) "blind" else "advertisement",
+                "rssi" to matchRssi.takeUnless { it == Int.MIN_VALUE }, "timeout_ms" to connectTimeoutMs,
+                "contact_age_ms" to (gattConnectStartedAtMillis - lastSensorContactAtMillis), "auto_connect" to autoConnect)
             true
         } catch (e: SecurityException) {
             Log.e(TAG, "connectGatt SecurityException: ${e.message}")
@@ -1527,12 +1488,21 @@ class BondProbeService : Service() {
     }
 
     private val gattCb = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+        override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int): Unit = synchronized(gattLock) {
+            if (!RecoveryPolicy.isCurrentCallback(gatt, g)) {
+                ConnectionJournal.record(this@BondProbeService, "stale_gatt_callback", "callback" to "onConnectionStateChange")
+                return
+            }
             Log.i(TAG, "onConnectionStateChange: status=$status, newState=$newState")
+            ConnectionJournal.record(this@BondProbeService, "gatt_state", "status" to status, "state" to newState,
+                "attempt_ms" to gattAttemptCreatedAtMillis.takeIf { it > 0L }?.let { System.currentTimeMillis() - it },
+                "services" to servicesDiscovered, "rssi" to currentGattMatchRssi.takeUnless { it == Int.MIN_VALUE })
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
+                    gattRetryPolicy.connected()
                     gattConnectStartedAtMillis = System.currentTimeMillis()
                     gattConnectedAtMillis = gattConnectStartedAtMillis
+                    gattConnectedAtElapsed = SystemClock.elapsedRealtime()
                     reconnectDelayMs = RECONNECT_DELAY_MS
                     directMacFailures = 0
                     updateNotif("Подключено, обнаружение сервисов…")
@@ -1549,9 +1519,24 @@ class BondProbeService : Service() {
                 }
 
 	                BluetoothProfile.STATE_DISCONNECTED -> {
+                        if (status != BluetoothGatt.GATT_SUCCESS && !servicesDiscovered) {
+                            BluetoothIncidentRecorder.capture(this@BondProbeService, "gatt_early_failure",
+                                "status" to status, "connected" to (gattConnectedAtElapsed > 0L),
+                                "rssi" to currentGattMatchRssi.takeUnless { it == Int.MIN_VALUE },
+                                "attempt_ms" to gattAttemptCreatedAtElapsed.takeIf { it > 0L }
+                                    ?.let { SystemClock.elapsedRealtime() - it })
+                        }
+                        val nowElapsed = SystemClock.elapsedRealtime()
+                        gattRetryPolicy.disconnected(status, gattConnectedAtElapsed > 0L, nowElapsed)
+                        gattRetryWaitLogged = false
+                        val retryDelay = gattRetryPolicy.remainingMs(nowElapsed)
+                        if (retryDelay > 0L) {
+                            ConnectionJournal.record(this@BondProbeService, "gatt_retry_pause",
+                                "status" to status, "delay_ms" to retryDelay)
+                        }
 	                    updateNotif("Отключено; переподключение…")
 		                    val now = System.currentTimeMillis()
-		                    val lastGlucoseAt = lastSuccessfulGlucoseAtMillis
+		                    val lastGlucoseAt = lastSensorContactAtMillis
 		                    val glucoseAge = if (lastGlucoseAt > 0L) now - lastGlucoseAt else 0L
 		                    val matchRssi = currentGattMatchRssi
 		                    if (!servicesDiscovered && config.knownMac.isNotBlank()) {
@@ -1610,7 +1595,7 @@ class BondProbeService : Service() {
                         )
 	                    }
 	                    reconnectDelayMs = nextReconnectDelay(status)
-	                    closeGatt("STATE_DISCONNECTED")
+	                    closeGatt("STATE_DISCONNECTED", alreadyDisconnected = true)
 	                    if (
 	                        status == 133 &&
 	                        !servicesDiscovered &&
@@ -1634,7 +1619,11 @@ class BondProbeService : Service() {
             }
         }
 
-        override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+        override fun onServicesDiscovered(g: BluetoothGatt, status: Int): Unit = synchronized(gattLock) {
+            if (!RecoveryPolicy.isCurrentCallback(gatt, g)) {
+                ConnectionJournal.record(this@BondProbeService, "stale_gatt_callback", "callback" to "onServicesDiscovered")
+                return
+            }
             Log.i(TAG, "onServicesDiscovered: status=$status, services=${g.services?.size ?: 0}")
             updateNotif("Сервисы найдены (${g.services?.size ?: 0}) — ждём auth/start")
             if (status != BluetoothGatt.GATT_SUCCESS) return
@@ -1647,7 +1636,11 @@ class BondProbeService : Service() {
             readAuthCharacteristic(g)
         }
 
-        override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
+        override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic): Unit = synchronized(gattLock) {
+            if (!RecoveryPolicy.isCurrentCallback(gatt, g)) {
+                ConnectionJournal.record(this@BondProbeService, "stale_gatt_callback", "callback" to "onCharacteristicChanged")
+                return
+            }
             val value = ch.value ?: byteArrayOf()
             Log.i(TAG, "onCharacteristicChanged: ${ch.uuid} len=${value.size} hex=${value.toHex()}")
             if (ch.uuid == authCharacteristic?.uuid && value.isNotEmpty()) {
@@ -1670,12 +1663,30 @@ class BondProbeService : Service() {
                     AUTH_OPCODE_SESSION_START_RX -> handleSessionStart(g, value)
                     SENSOR_OPCODE, GLUCOSE_OPCODE, E_GLUCOSE_OPCODE, E_GLUCOSE2_OPCODE -> {
                         val opcode = value[0].toInt() and 0xFF
-                        runCatching { decodeGlucoseLikeRx(value) }
+                        runCatching { SensorProtocol.reading(value) }
                             .onSuccess { sensor ->
+                                lastSensorContactAtMillis = System.currentTimeMillis()
+                                SensorSessionStore.recordReading(this@BondProbeService, sensor, lastSensorContactAtMillis)
+                                earlyGattFailureCount = 0
+                                consecutiveSilentBroadScanRestarts = 0
+                                sensorRequestSent = false
+                                if (!sensor.usable) {
+                                    val status = SensorSessionStore.load(this@BondProbeService).glucoseStatus()
+                                    updateNotif(status)
+                                    requestComplicationRefresh("sensor status", force = true)
+                                    scheduleNextReadingWindowAlarm("sensor status")
+                                    releaseReadingWindowWakeLock("sensor status received")
+                                    keepGattAfterGlucose(g)
+                                    return@onSuccess
+                                }
                                 val previousDirect = DexcomConfigStore.loadDirectGlucose(this@BondProbeService)
+                                val timestampRollbackSeconds = previousDirect.dexTimestamp - sensor.timestamp
+                                val looksLikeNewTransmitterTimeline =
+                                    timestampRollbackSeconds >= DEXCOM_TIMESTAMP_RESET_ACCEPT_SECONDS
                                 if (
                                     previousDirect.dexTimestamp > 0 &&
-                                    sensor.timestamp <= previousDirect.dexTimestamp
+                                    sensor.timestamp <= previousDirect.dexTimestamp &&
+                                    !looksLikeNewTransmitterTimeline
                                 ) {
                                     sensorRequestSent = false
                                     val event = "duplicate glucose ${sensor.glucose} mg/dL opcode=0x${opcode.toString(16).uppercase()} ts=${sensor.timestamp} currentTs=${previousDirect.dexTimestamp}"
@@ -1692,12 +1703,24 @@ class BondProbeService : Service() {
                                     keepGattAfterGlucose(g)
                                     return@onSuccess
                                 }
-                                lastSuccessfulGlucoseAtMillis = System.currentTimeMillis()
+                                if (looksLikeNewTransmitterTimeline) {
+                                    val resetEvent =
+                                        "dex timestamp reset accepted ${previousDirect.dexTimestamp}->${sensor.timestamp}; treating as new transmitter/session"
+                                    Log.w(TAG, resetEvent)
+                                    DexcomConfigStore.saveScanDebug(
+                                        this@BondProbeService,
+                                        "Dexcom connected",
+                                        g.device?.address ?: "",
+                                        null,
+                                        resetEvent,
+                                    )
+                                }
+                                lastSensorContactAtMillis = System.currentTimeMillis()
                                 earlyGattFailureCount = 0
                                 consecutiveSilentBroadScanRestarts = 0
                                 sensorRequestSent = false
                                 lastSensorRequestAtMillis = 0L
-                                preferScanUntilMillis = lastSuccessfulGlucoseAtMillis + PREFER_SCAN_AFTER_SUCCESS_MS
+                                preferScanUntilMillis = lastSensorContactAtMillis + PREFER_SCAN_AFTER_SUCCESS_MS
                                 forceBroadScanUntilMillis = 0L
                                 releaseReadingWindowWakeLock("glucose received")
                                 val event = "GLUCOSE ${sensor.glucose} mg/dL opcode=0x${opcode.toString(16).uppercase()} ts=${sensor.timestamp} age=${sensor.ageSeconds}"
@@ -1746,7 +1769,11 @@ class BondProbeService : Service() {
             g: BluetoothGatt,
             ch: BluetoothGattCharacteristic,
             status: Int,
-        ) {
+        ): Unit = synchronized(gattLock) {
+            if (!RecoveryPolicy.isCurrentCallback(gatt, g)) {
+                ConnectionJournal.record(this@BondProbeService, "stale_gatt_callback", "callback" to "onCharacteristicRead")
+                return
+            }
             val value = ch.value ?: byteArrayOf()
             Log.i(TAG, "onCharacteristicRead: uuid=${ch.uuid} status=$status hex=${value.toHex()}")
             if (status != BluetoothGatt.GATT_SUCCESS || ch.uuid != authCharacteristic?.uuid || value.isEmpty()) return
@@ -1766,7 +1793,11 @@ class BondProbeService : Service() {
             g: BluetoothGatt,
             descriptor: BluetoothGattDescriptor,
             status: Int,
-        ) {
+        ): Unit = synchronized(gattLock) {
+            if (!RecoveryPolicy.isCurrentCallback(gatt, g)) {
+                ConnectionJournal.record(this@BondProbeService, "stale_gatt_callback", "callback" to "onDescriptorWrite")
+                return
+            }
             Log.i(TAG, "onDescriptorWrite: ${descriptor.characteristic.uuid} status=$status")
             if (status != BluetoothGatt.GATT_SUCCESS) return
             if (descriptor.characteristic.uuid == authCharacteristic?.uuid) {
@@ -1785,7 +1816,11 @@ class BondProbeService : Service() {
             g: BluetoothGatt,
             ch: BluetoothGattCharacteristic,
             status: Int,
-        ) {
+        ): Unit = synchronized(gattLock) {
+            if (!RecoveryPolicy.isCurrentCallback(gatt, g)) {
+                ConnectionJournal.record(this@BondProbeService, "stale_gatt_callback", "callback" to "onCharacteristicWrite")
+                return
+            }
             val value = ch.value ?: byteArrayOf()
             Log.i(TAG, "onCharacteristicWrite: uuid=${ch.uuid} status=$status hex=${value.toHex()}")
             if (status != BluetoothGatt.GATT_SUCCESS) return
@@ -1795,7 +1830,11 @@ class BondProbeService : Service() {
             }
         }
 
-        override fun onReadRemoteRssi(g: BluetoothGatt, rssi: Int, status: Int) {
+        override fun onReadRemoteRssi(g: BluetoothGatt, rssi: Int, status: Int): Unit = synchronized(gattLock) {
+            if (!RecoveryPolicy.isCurrentCallback(gatt, g)) {
+                ConnectionJournal.record(this@BondProbeService, "stale_gatt_callback", "callback" to "onReadRemoteRssi")
+                return
+            }
             Log.d(TAG, "RSSI=$rssi status=$status")
         }
     }
@@ -1840,17 +1879,18 @@ class BondProbeService : Service() {
         return true
     }
 
-    private fun handleReadingWindowRefreshRequest(): Boolean {
+    private fun handleReadingWindowRefreshRequest(): Boolean = synchronized(gattLock) {
         val requestedAt = readingWindowRefreshRequestedAtMillis
         if (requestedAt <= 0L) return false
         readingWindowRefreshRequestedAtMillis = 0L
         maybeEnsureReadingWindowWakeLock("alarm worker")
         if (gatt != null || btAdapter?.isEnabled != true) return false
-        if (scanning && currentScanBroad) return false
+        if (scanning) {
+            currentScanBroad = true
+            return false
+        }
 
-        Log.i(TAG, "Reading-window alarm refreshing scan before Dexcom packet")
-        runCatching { stopScan() }
-        sleep(SCANNER_STOP_START_SETTLE_MS)
+        Log.i(TAG, "Reading-window alarm starting missing scanner before Dexcom packet")
         runCatching { startScanInternal() }
         return true
     }
@@ -1872,7 +1912,15 @@ class BondProbeService : Service() {
         closeGatt(reason)
     }
 
-    private fun closeGatt(reason: String) {
+    private fun closeGatt(
+        reason: String,
+        expected: BluetoothGatt? = null,
+        alreadyDisconnected: Boolean = false,
+    ): Boolean = synchronized(gattLock) {
+        if (expected != null && gatt !== expected) return false
+        gattAttemptCreatedAtMillis = 0L
+        gattAttemptCreatedAtElapsed = 0L
+        gattConnectedAtElapsed = 0L
         gattConnectStartedAtMillis = 0L
         gattConnectedAtMillis = 0L
         currentGattAutoConnect = false
@@ -1880,16 +1928,19 @@ class BondProbeService : Service() {
         currentGattMatchRssi = Int.MIN_VALUE
         lastSensorRequestAtMillis = 0L
         resetWeakMatchCandidate()
-        gatt?.let {
+        val closing = gatt
+        gatt = null
+        closing?.let {
             Log.i(TAG, "closeGatt ($reason)")
-            runCatching { it.disconnect() }
+            if (!alreadyDisconnected) runCatching { it.disconnect() }
             runCatching { it.close() }
         }
-        gatt = null
+        true
     }
 
-    private fun startScanInternal(): Boolean {
+    private fun startScanInternal(): Boolean = synchronized(gattLock) {
         if (scanning) return true
+        if (gatt != null || !wantConnected) return false
         ensureCollectorWakeLock("start scan")
         maybeEnsureReadingWindowWakeLock("start scan")
         val adapter = btAdapter ?: return false
@@ -1933,7 +1984,9 @@ class BondProbeService : Service() {
             // manual validation in the callback before connecting.
             bleScanner.startScan(filters.ifEmpty { null }, settings, leCallback)
             lastScanStartedAtMillis = scanStartedAt
+            lastScanStartedAtElapsed = SystemClock.elapsedRealtime()
             lastAnyScanCallbackAtMillis = 0L
+            ConnectionJournal.record(this, "scan_started", "filters" to filters.size)
             val filterMode = when {
                 isBroadRecoveryScanActive() -> "(dexcom-filtered recovery)"
                 shouldUseBroadNearReadingWindow() -> "(dexcom-filtered reading window)"
@@ -1962,22 +2015,41 @@ class BondProbeService : Service() {
         return false
     }
 
-    private fun stopScan() {
+    private fun refreshScanBeforePlatformTimeout(): Boolean = synchronized(gattLock) {
+        if (!scanning || gatt != null || !wantConnected || btAdapter?.isEnabled != true) return false
+        val now = System.currentTimeMillis()
+        if (pendingMatchConnectUntilMillis > now || lastScanStartedAtElapsed <= 0L) return false
+        val scanAge = SystemClock.elapsedRealtime() - lastScanStartedAtElapsed
+        val contactAge = lastSensorContactAtMillis.takeIf { it > 0L }?.let { now - it }
+        if (!RecoveryPolicy.shouldRefreshScan(scanAge, contactAge)) return false
+
+        ConnectionJournal.record(this, "scan_refresh", "reason" to "before_platform_timeout",
+            "scan_age_ms" to scanAge, "contact_age_ms" to contactAge)
+        stopScan()
+        sleep(SCANNER_STOP_START_SETTLE_MS)
+        startScanInternal()
+    }
+
+    private fun stopScan(): Unit = synchronized(gattLock) {
         if (!scanning) return
         try {
             scanner?.stopScan(leCallback)
         } catch (_: Exception) {
         }
+        ConnectionJournal.record(this, "scan_stopped", "scan_age_ms" to
+            lastScanStartedAtElapsed.takeIf { it > 0L }?.let { SystemClock.elapsedRealtime() - it })
         scanning = false
         currentScanBroad = false
         scanner = null
         lastScanStartedAtMillis = 0L
+        lastScanStartedAtElapsed = 0L
         lastAnyScanCallbackAtMillis = 0L
         Log.i(TAG, "Scan stopped")
     }
 
     private val leCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult) {
+        override fun onScanResult(callbackType: Int, result: ScanResult): Unit = synchronized(gattLock) {
+            if (!wantConnected || gatt != null) return
             val now = System.currentTimeMillis()
             lastAnyScanCallbackAtMillis = now
             consecutiveSilentBroadScanRestarts = 0
@@ -2025,6 +2097,10 @@ class BondProbeService : Service() {
                 Log.i(TAG, "adv-first: [$addr] name=$name raw=$raw")
             }
             if (match) {
+                val packetAge = (SystemClock.elapsedRealtimeNanos() - result.timestampNanos) / 1_000_000L
+                ConnectionJournal.record(this@BondProbeService, "sensor_advertisement",
+                    "packet_age_ms" to packetAge, "rssi" to result.rssi, "connectable" to connectable,
+                    "interactive" to getSystemService(PowerManager::class.java)?.isInteractive)
                 DexcomConfigStore.saveScanDebug(
                     this@BondProbeService,
                     name ?: "",
@@ -2035,6 +2111,16 @@ class BondProbeService : Service() {
             }
 
             if (match) {
+
+                val retryWait = gattRetryPolicy.remainingMs(SystemClock.elapsedRealtime())
+                if (retryWait > 0L) {
+                    if (!gattRetryWaitLogged) {
+                        ConnectionJournal.record(this@BondProbeService, "gatt_retry_wait",
+                            "remaining_ms" to retryWait, "scanning" to scanning)
+                        gattRetryWaitLogged = true
+                    }
+                    return
+                }
 	                if (!connectable) {
 	                    Log.i(TAG, "MATCH non-connectable: $name [$addr] — keeping scan open for connectable Dexcom window")
 	                    DexcomConfigStore.saveScanDebug(
@@ -2115,7 +2201,7 @@ class BondProbeService : Service() {
 		                    return
 		                }
                 if (shouldHonorConnectCooldown(now)) {
-                    val last = lastSuccessfulGlucoseAtMillis
+                    val last = lastSensorContactAtMillis
                     val age = if (last > 0L) now - last else 0L
                     Log.i(TAG, "MATCH shortly after glucose (${age}ms); suppressing duplicate connect")
                     DexcomConfigStore.saveScanDebug(
@@ -2146,6 +2232,19 @@ class BondProbeService : Service() {
         }
 
         override fun onScanFailed(errorCode: Int) {
+            BluetoothIncidentRecorder.capture(this@BondProbeService, "scan_failure", "error_code" to errorCode)
+            if (errorCode == ScanCallback.SCAN_FAILED_ALREADY_STARTED) {
+                Log.w(TAG, "BLE scan already started; keeping scanner state instead of recovery storm")
+                scanning = true
+                DexcomConfigStore.saveScanDebug(
+                    this@BondProbeService,
+                    "",
+                    config.knownMac,
+                    null,
+                    "scan already started; keeping active",
+                )
+                return
+            }
             Log.e(TAG, "Scan failed: $errorCode")
             scanning = false
             currentScanBroad = false
@@ -2464,13 +2563,15 @@ class BondProbeService : Service() {
     }
 
     private fun handleTransmitterTime(gatt: BluetoothGatt, value: ByteArray) {
-        if (value.size < 10) {
-            Log.w(TAG, "TransmitterTime packet too short: ${value.toHex()}")
+        val session = runCatching { SensorProtocol.session(value) }.getOrElse {
+            Log.w(TAG, "Invalid transmitter time response", it)
             return
         }
-        val currentTime = ByteBuffer.wrap(value, 2, 4).order(ByteOrder.LITTLE_ENDIAN).int
-        val sessionStartTime = ByteBuffer.wrap(value, 6, 4).order(ByteOrder.LITTLE_ENDIAN).int
-        Log.i(TAG, "TransmitterTime current=$currentTime sessionStart=$sessionStartTime hex=${value.toHex()}")
+        val currentTime = session.transmitterTime
+        val sessionStartTime = session.startTime
+        SensorSessionStore.recordTime(this, session, System.currentTimeMillis())
+        requestComplicationRefresh("sensor session time", force = true)
+        Log.i(TAG, "TransmitterTime current=$currentTime sessionStart=$sessionStartTime")
         timeRequestSent = false
         if (sessionStartTime != -1 && currentTime != sessionStartTime) {
             Log.i(TAG, "Sensor session already active on transmitter; requesting glucose data")
@@ -2487,26 +2588,11 @@ class BondProbeService : Service() {
             }
             return
         }
-        val sensorCode = config.sensorCode
-        if (sessionStartSent || sensorCode.isBlank()) {
-            enableControlNotifications(gatt)
-            return
-        }
+        // Reconnecting is read-only: a missing session is never authorization to start one.
+        updateNotif("Сессия сенсора завершена. Запустите новый сенсор на телефоне.")
         protocolWorker.execute {
-            sleep(150)
-            sendSessionStart(gatt, currentTime, sensorCode)
+            if (this.gatt === gatt) writeSensorRequest(gatt)
         }
-    }
-
-    private fun sendSessionStart(gatt: BluetoothGatt, currentDexTime: Int, sensorCode: String) {
-        if (sessionStartSent) return
-        val control = controlCharacteristic ?: return
-        val packet = buildSessionStartTx(System.currentTimeMillis(), currentDexTime, sensorCode)
-        sessionStartSent = true
-        Log.i(TAG, "Sending SessionStartTx ${packet.toHex()}")
-        val ok = writeCharacteristicBytes(gatt, control, packet)
-        Log.i(TAG, "writeSessionStartTx -> $ok")
-        if (!ok) sessionStartSent = false
     }
 
     private fun handleSessionStart(gatt: BluetoothGatt, value: ByteArray) {
@@ -2561,7 +2647,11 @@ class BondProbeService : Service() {
         gatt: BluetoothGatt,
         characteristic: BluetoothGattCharacteristic,
         packet: ByteArray,
-    ): Boolean {
+    ): Boolean = synchronized(gattLock) {
+        if (this.gatt !== gatt) {
+            ConnectionJournal.record(this, "stale_gatt_write", "opcode" to packet.firstOrNull()?.toInt()?.and(255))
+            return false
+        }
         val ok = runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 val status = gatt.writeCharacteristic(
@@ -2751,44 +2841,6 @@ class BondProbeService : Service() {
             crc = (crc shl 8) xor table[((crc ushr 8) xor bytes[i].toInt()) and 0xff]
         }
         return byteArrayOf((crc and 0xff).toByte(), ((crc ushr 8) and 0xff).toByte())
-    }
-
-    private data class SensorRx(
-        val timestamp: Int,
-        val glucose: Int,
-        val ageSeconds: Int,
-    )
-
-    private fun decodeGlucoseLikeRx(packet: ByteArray): SensorRx {
-        if (packet.isNotEmpty() && packet[0].toInt() and 0xFF == E_GLUCOSE2_OPCODE && packet.size >= 19) {
-            val data = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
-            data.get()
-            data.get()
-            val timestamp = data.int
-            data.short // sequence
-            data.short // reserved/bogus
-            val age = data.short.toInt() and 0xFFFF
-            val glucoseBytes = data.short.toInt() and 0xFFFF
-            val glucose = glucoseBytes and 0x0FFF
-            return SensorRx(timestamp, glucose, age)
-        }
-        if (packet.isNotEmpty() && (packet[0].toInt() and 0xFF == E_GLUCOSE_OPCODE || packet[0].toInt() and 0xFF == GLUCOSE_OPCODE) && packet.size >= 14) {
-            val data = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
-            data.get()
-            data.get()
-            val sequenceOrTimestamp = data.int
-            val timestamp = data.int
-            val glucoseBytes = data.short.toInt() and 0xFFFF
-            val glucose = glucoseBytes and 0x0FFF
-            return SensorRx(timestamp.takeIf { it != 0 } ?: sequenceOrTimestamp, glucose, 0)
-        }
-        val data = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
-        data.get()
-        data.get()
-        val timestamp = data.int
-        val unfiltered = data.int
-        data.int
-        return SensorRx(timestamp, unfiltered / 1000, 0)
     }
 
     private fun ByteArray?.toHex(): String = this?.joinToString(separator = "") { "%02X".format(it) } ?: ""

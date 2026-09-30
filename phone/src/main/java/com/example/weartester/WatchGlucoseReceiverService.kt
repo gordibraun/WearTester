@@ -6,6 +6,7 @@ import com.google.android.gms.wearable.DataEventBuffer
 import com.google.android.gms.wearable.DataMapItem
 import com.google.android.gms.wearable.MessageEvent
 import com.google.android.gms.wearable.WearableListenerService
+import com.google.android.gms.wearable.Wearable
 import org.json.JSONObject
 
 class WatchGlucoseReceiverService : WearableListenerService() {
@@ -16,6 +17,7 @@ class WatchGlucoseReceiverService : WearableListenerService() {
                 val item = event.dataItem
                 if (item.uri.path != GlucoseSyncBridge.PATH_WATCH_GLUCOSE) continue
                 val map = DataMapItem.fromDataItem(item).dataMap
+                acknowledge(item.uri.host.orEmpty(), map.getLong("sentAt", 0L), map.getLong(GlucoseSyncBridge.KEY_TIMESTAMP, 0L), "glucose_received")
                 GlucoseSyncBridge.acceptWatchGlucose(
                     context = applicationContext,
                     mgdl = map.getInt(GlucoseSyncBridge.KEY_MGDL, -1),
@@ -31,9 +33,18 @@ class WatchGlucoseReceiverService : WearableListenerService() {
     }
 
     override fun onMessageReceived(messageEvent: MessageEvent) {
+        if (messageEvent.path == "/weartester/diagnostic/ping") {
+            runCatching {
+                val ping = JSONObject(String(messageEvent.data, Charsets.UTF_8))
+                acknowledge(messageEvent.sourceNodeId, ping.optLong("sentAt", 0), 0, "heartbeat")
+            }.onFailure { ConnectionJournal.record(this, "invalid_ping") }
+            return
+        }
         if (messageEvent.path != GlucoseSyncBridge.PATH_WATCH_GLUCOSE) return
         runCatching {
             val json = JSONObject(String(messageEvent.data, Charsets.UTF_8))
+            acknowledge(messageEvent.sourceNodeId, json.optLong("sentAt", json.optLong(GlucoseSyncBridge.KEY_TIMESTAMP, 0)),
+                json.optLong(GlucoseSyncBridge.KEY_TIMESTAMP, 0), "glucose_received")
             GlucoseSyncBridge.acceptWatchGlucose(
                 context = applicationContext,
                 mgdl = json.optInt(GlucoseSyncBridge.KEY_MGDL, -1),
@@ -51,5 +62,14 @@ class WatchGlucoseReceiverService : WearableListenerService() {
 
     companion object {
         private const val TAG = "GlucoseSyncBridge"
+    }
+
+    private fun acknowledge(node: String, sentAt: Long, readingAt: Long, stage: String) {
+        ConnectionJournal.record(this, "watch_message_received", "stage" to stage, "reading_at" to readingAt,
+            "transport_age_ms" to (System.currentTimeMillis() - sentAt))
+        if (node.isBlank()) return
+        val payload = JSONObject().put("sentAt", sentAt).put("readingAt", readingAt).put("stage", stage).toString().toByteArray()
+        Wearable.getMessageClient(this).sendMessage(node, "/weartester/diagnostic/ack", payload)
+            .addOnFailureListener { ConnectionJournal.record(this, "ack_failed", "error" to it.javaClass.simpleName) }
     }
 }

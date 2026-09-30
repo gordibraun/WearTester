@@ -137,6 +137,7 @@ object GlucoseSyncBridge {
             .putExtra(EXTRA_AGE_SECONDS, ageSeconds)
             .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
         context.sendBroadcast(legacyIntent)
+        ConnectionJournal.record(context, "glucose_forwarded_to_xdrip_broadcast", "sample_at" to timestamp)
         Log.i(TAG, "Forwarded watch glucose to xDrip via Nightscout SGV: $mgdl @ $timestamp source=$source")
     }
 

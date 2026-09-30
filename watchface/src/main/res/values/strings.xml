@@ -1,4 +1,5 @@
 <resources>
     <string name="app_name">Dexcom Live Face</string>
     <string name="glucose_slot_name">Glucose</string>
+    <string name="sensor_expiry_slot_name">Срок сенсора</string>
 </resources>

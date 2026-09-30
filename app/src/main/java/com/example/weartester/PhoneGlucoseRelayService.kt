@@ -29,6 +29,10 @@ class PhoneGlucoseRelayService : WearableListenerService() {
     }
 
     override fun onMessageReceived(messageEvent: MessageEvent) {
+        if (messageEvent.path == ConnectionMonitor.ACK) {
+            ConnectionMonitor.acceptAck(this, messageEvent.data)
+            return
+        }
         if (messageEvent.path != PATH_GLUCOSE) return
         runCatching {
             val json = JSONObject(String(messageEvent.data, Charsets.UTF_8))

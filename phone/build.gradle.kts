@@ -11,9 +11,10 @@ android {
         applicationId = "com.example.weartester"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
+    sourceSets.getByName("main").java.srcDir("../shared/src/main/java")
 
     buildTypes {
         release {
@@ -35,6 +36,6 @@ android {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     implementation(libs.play.services.wearable)
 }
-
