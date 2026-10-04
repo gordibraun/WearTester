@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.weartester"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
     }
     sourceSets.getByName("main").java.srcDir("../shared/src/main/java")
 
