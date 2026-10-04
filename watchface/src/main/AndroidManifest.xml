@@ -4,6 +4,7 @@
     <queries>
         <package android:name="com.example.weartester" />
         <package android:name="info.nightscout.androidaps" />
+        <package android:name="app.aaps.combobench.manual" />
         <intent>
             <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
         </intent>

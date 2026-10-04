@@ -31,7 +31,9 @@ import android.content.Intent
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import android.os.VibrationEffect
@@ -56,8 +58,11 @@ import java.security.InvalidKeyException
 import java.security.NoSuchAlgorithmException
 import java.security.SecureRandom
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import javax.crypto.BadPaddingException
 import javax.crypto.Cipher
 import javax.crypto.IllegalBlockSizeException
@@ -81,7 +86,9 @@ class BondProbeService : Service() {
         private const val BLE_RECOVERY_SETTLE_MS = 1_500L
         private const val SCAN_FAILED_RECOVERY_RETRY_DELAY_MS = 2_000L
         private const val SCANNER_STOP_START_SETTLE_MS = 250L
-        private const val CONNECT_AFTER_SCAN_STOP_DELAY_MS = 80L
+        private const val CONNECT_AFTER_SCAN_STOP_DELAY_MS = 150L
+        /** What the rest of the transmitter's advertising burst allows a second, background connect. */
+        private const val IN_WINDOW_RETRY_TIMEOUT_MS = 12_000L
         private const val MATCH_CONNECT_GRACE_MS = 10_000L
         private const val MIN_CONNECTABLE_DEXCOM_RSSI = -98
         private const val POST_GATT_FAILURE_MIN_CONNECT_RSSI = -94
@@ -95,6 +102,12 @@ class BondProbeService : Service() {
         private const val PHONE_RELAY_UDP_BUFFER_BYTES = 2048
         private const val SCAN_DEBUG_THROTTLE_MS = 30_000L
         private const val DEXCOM_READING_PERIOD_MS = 5 * 60_000L
+
+        /**
+         * A connect failing early this close to (or past) the next reading is in the reading window:
+         * the transmitter is up and advertising, and another display device may have got it first.
+         */
+        private const val QUICK_RETRY_WINDOW_LEAD_MS = 20_000L
         private const val POST_GATT_FAILURE_RSSI_GUARD_MS = DEXCOM_READING_PERIOD_MS + 30_000L
         private const val WEAK_MATCH_FALLBACK_AFTER_MS = 2_000L
         private const val WEAK_MATCH_CANDIDATE_RESET_MS = 15_000L
@@ -157,6 +170,7 @@ class BondProbeService : Service() {
     private val collectorStartedAt = System.currentTimeMillis()
     @Volatile private var wantConnected = true
     @Volatile private var config: DexcomConfig = DexcomConfig("", "", "")
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val worker: ExecutorService = Executors.newSingleThreadExecutor()
     private val protocolWorker: ExecutorService = Executors.newSingleThreadExecutor()
     private val watchdogWorker: ExecutorService = Executors.newSingleThreadExecutor()
@@ -206,6 +220,8 @@ class BondProbeService : Service() {
     @Volatile private var pendingBleRecoveryReason = ""
     @Volatile private var pendingMatchConnectUntilMillis = 0L
     @Volatile private var readingWindowRefreshRequestedAtMillis = 0L
+    /** Whether the one immediate retry a hung connect is allowed has been spent in this window. */
+    @Volatile private var inWindowRetryUsed = false
     @Volatile private var weakGattFailureGuardUntilMillis = 0L
     @Volatile private var currentGattMatchRssi = Int.MIN_VALUE
     @Volatile private var weakMatchCandidateFirstAtMillis = 0L
@@ -1274,8 +1290,24 @@ class BondProbeService : Service() {
             "attempt_ms" to attemptAge, "connected_ms" to connectedAge)
         val reason = "gatt ${phase.name} timeout ${attemptAge}ms"
         DexcomConfigStore.saveScanDebug(this, "", config.knownMac, null, reason)
+        val device = attempt.device
+        val matchRssi = currentGattMatchRssi
         if (!closeGatt(reason, attempt)) return false
-        // Retry only after a new advertisement, never blindly on the old packet.
+        // A connect that hung before CONNECTED never reached the transmitter, which goes on
+        // advertising for the rest of its ~15 s burst. One more try, at once, on the same device
+        // - once per window, so a transmitter that really is gone costs one short attempt, not a
+        // storm. The retry goes the other way through the stack: a direct connect issued right
+        // after a hung one hung again both times it was seen (3 Oct); a background connect lets
+        // the stack itself connect on the next advertisement it hears. It gets the rest of the
+        // burst. Only after that does the usual rule hold: wait for a new advertisement.
+        if (phase == GattTimeoutPolicy.Phase.CONNECTING && !inWindowRetryUsed && wantConnected && btAdapter?.isEnabled == true) {
+            inWindowRetryUsed = true
+            ConnectionJournal.record(this, "in_window_retry", "after_ms" to attemptAge, "rssi" to matchRssi.takeUnless { it == Int.MIN_VALUE })
+            Log.i(TAG, "connect hung ${attemptAge}ms; retrying once within the window by background connect")
+            // Not "expired" for the caller: a new attempt is under way and the wait loop keeps
+            // watching it, so that its own deadline is seen on time.
+            if (connectGatt(device, connectTimeoutMs = IN_WINDOW_RETRY_TIMEOUT_MS, matchRssi = matchRssi, autoConnectOverride = true, inWindowRetry = true)) return false
+        }
         if (wantConnected && btAdapter?.isEnabled == true && !scanning) startScanInternal()
         true
     }
@@ -1441,9 +1473,12 @@ class BondProbeService : Service() {
         connectTimeoutMs: Long = CONNECT_ATTEMPT_TIMEOUT_MS,
         matchRssi: Int = Int.MIN_VALUE,
         autoConnectOverride: Boolean? = null,
+        inWindowRetry: Boolean = false,
     ): Boolean = synchronized(gattLock) {
         if (gatt != null || !wantConnected) return false
         if (gattRetryPolicy.remainingMs(SystemClock.elapsedRealtime()) > 0L) return false
+        // A fresh attempt opens a fresh window: it may be retried once if it hangs.
+        if (!inWindowRetry) inWindowRetryUsed = false
         ensureCollectorWakeLock("connect gatt")
         closeGatt("before new connect")
         bondFlowStarted = false
@@ -1467,14 +1502,10 @@ class BondProbeService : Service() {
             gattConnectStartedAtMillis = System.currentTimeMillis()
             gattAttemptCreatedAtMillis = gattConnectStartedAtMillis
             gattAttemptCreatedAtElapsed = SystemClock.elapsedRealtime()
-            gatt = device.connectGatt(
-                this,
-                autoConnect,
-                gattCb,
-                BluetoothDevice.TRANSPORT_LE,
-            )
+            gatt = issueConnectOnMainThread(device, autoConnect)
             Log.i(TAG, "connectGatt issued autoConnect=$autoConnect timeout=${connectTimeoutMs}ms")
-            ConnectionJournal.record(this, "gatt_attempt", "source" to if (matchRssi == Int.MIN_VALUE) "blind" else "advertisement",
+            ConnectionJournal.record(this, "gatt_attempt",
+                "source" to when { inWindowRetry -> "in_window_retry"; matchRssi == Int.MIN_VALUE -> "blind"; else -> "advertisement" },
                 "rssi" to matchRssi.takeUnless { it == Int.MIN_VALUE }, "timeout_ms" to connectTimeoutMs,
                 "contact_age_ms" to (gattConnectStartedAtMillis - lastSensorContactAtMillis), "auto_connect" to autoConnect)
             true
@@ -1485,6 +1516,35 @@ class BondProbeService : Service() {
             Log.e(TAG, "connectGatt error: ${e.message}")
             false
         }
+    }
+
+    // OnePlus Watch 3: issuing device.connectGatt() from the binder scan-callback
+    // thread intermittently produces status 133 or a silent CONNECTING hang (no
+    // callback at all), which costs a whole 5-minute Dexcom window. Running the
+    // connect on the main looper is the documented-reliable path. The posted call
+    // returns almost immediately (it only registers the client), so the short wait
+    // here resolves in milliseconds; the 2s cap is a safety net, never the norm.
+    private fun issueConnectOnMainThread(
+        device: BluetoothDevice,
+        autoConnect: Boolean,
+    ): BluetoothGatt? {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            return device.connectGatt(this, autoConnect, gattCb, BluetoothDevice.TRANSPORT_LE)
+        }
+        val result = AtomicReference<BluetoothGatt?>(null)
+        val latch = CountDownLatch(1)
+        mainHandler.post {
+            result.set(
+                runCatching {
+                    device.connectGatt(this, autoConnect, gattCb, BluetoothDevice.TRANSPORT_LE)
+                }.getOrNull(),
+            )
+            latch.countDown()
+        }
+        if (!latch.await(2, TimeUnit.SECONDS)) {
+            Log.w(TAG, "connectGatt main-thread dispatch timed out")
+        }
+        return result.get()
     }
 
     private val gattCb = object : BluetoothGattCallback() {
@@ -1527,7 +1587,19 @@ class BondProbeService : Service() {
                                     ?.let { SystemClock.elapsedRealtime() - it })
                         }
                         val nowElapsed = SystemClock.elapsedRealtime()
-                        gattRetryPolicy.disconnected(status, gattConnectedAtElapsed > 0L, nowElapsed)
+                        // An early 133 of a connect made from an advertisement, inside the reading
+                        // window: most likely another display device (the phone's xDrip, 4 Oct) got
+                        // the transmitter first. It advertises again for its second client within
+                        // seconds, so the next packet is connected to at once instead of after a pause.
+                        val sensorAgeMs = lastSensorContactAtMillis.takeIf { it > 0L }?.let { System.currentTimeMillis() - it }
+                        val quickRetry = status == 133 && gattConnectedAtElapsed <= 0L && !servicesDiscovered &&
+                            currentGattMatchRssi != Int.MIN_VALUE && sensorAgeMs != null &&
+                            sensorAgeMs >= DEXCOM_READING_PERIOD_MS - QUICK_RETRY_WINDOW_LEAD_MS
+                        if (gattRetryPolicy.disconnected(status, gattConnectedAtElapsed > 0L, nowElapsed, quickRetry)) {
+                            ConnectionJournal.record(this@BondProbeService, "gatt_quick_retry",
+                                "status" to status, "sensor_age_ms" to sensorAgeMs, "rssi" to currentGattMatchRssi)
+                            Log.i(TAG, "Early GATT $status inside the reading window; the next advertisement is connected to at once")
+                        }
                         gattRetryWaitLogged = false
                         val retryDelay = gattRetryPolicy.remainingMs(nowElapsed)
                         if (retryDelay > 0L) {
@@ -1671,6 +1743,20 @@ class BondProbeService : Service() {
                                 consecutiveSilentBroadScanRestarts = 0
                                 sensorRequestSent = false
                                 if (!sensor.usable) {
+                                    if (sensor.displayOnly && sensor.state in setOf(6, 7) && sensor.glucose in 20..600 && sensor.ageSeconds < 305) {
+                                        // Shown with a mark on the face; not handed to the phone or the pump controller.
+                                        Log.i(TAG, "display-only glucose ${sensor.glucose} mg/dL; shown, not forwarded")
+                                        DexcomConfigStore.saveDisplayOnlyGlucose(
+                                            this@BondProbeService, sensor.glucose, sensor.timestamp, sensor.ageSeconds,
+                                            "opcode=0x${opcode.toString(16).uppercase()} display-only",
+                                        )
+                                        updateNotif("Dexcom: ${sensor.glucose} (не подтверждено передатчиком)")
+                                        requestComplicationRefresh("display-only glucose", force = true)
+                                        scheduleNextReadingWindowAlarm("display-only glucose")
+                                        releaseReadingWindowWakeLock("display-only glucose received")
+                                        keepGattAfterGlucose(g)
+                                        return@onSuccess
+                                    }
                                     val status = SensorSessionStore.load(this@BondProbeService).glucoseStatus()
                                     updateNotif(status)
                                     requestComplicationRefresh("sensor status", force = true)
@@ -1933,6 +2019,10 @@ class BondProbeService : Service() {
         closing?.let {
             Log.i(TAG, "closeGatt ($reason)")
             if (!alreadyDisconnected) runCatching { it.disconnect() }
+            // Clear the stale GATT service cache before releasing the client. A
+            // poisoned cache is a common cause of status 133 on the next connect;
+            // refresh() is hidden API, hence reflection, and best-effort.
+            runCatching { it.javaClass.getMethod("refresh").invoke(it) }
             runCatching { it.close() }
         }
         true

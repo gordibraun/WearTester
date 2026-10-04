@@ -2,4 +2,8 @@
     <string name="app_name">Dexcom Live Face</string>
     <string name="glucose_slot_name">Glucose</string>
     <string name="sensor_expiry_slot_name">Срок сенсора</string>
+    <string name="forecast_slot_name">Прогноз</string>
+    <string name="graph_slot_name">График</string>
+    <string name="pump_slot_name">Помпа</string>
+    <string name="link_slot_name">Связь</string>
 </resources>

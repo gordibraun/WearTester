@@ -1,6 +1,8 @@
 package com.example.weartester
 
+import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
 import android.util.Log
 import com.google.android.gms.wearable.PutDataMapRequest
 import com.google.android.gms.wearable.Wearable
@@ -29,6 +31,8 @@ object GlucoseSyncBridge {
         }
         val readingAt = reading.receivedAtMillis.takeIf { it > 0L } ?: System.currentTimeMillis()
         val source = "watch-dexcom:${reading.source}"
+
+        handToPumpController(context, mgdl, readingAt, reading.ageSeconds)
 
         val request = PutDataMapRequest.create(PATH_WATCH_GLUCOSE).apply {
             dataMap.putInt(KEY_MGDL, mgdl)
@@ -78,6 +82,30 @@ object GlucoseSyncBridge {
                 Log.w(TAG, "Failed to list connected phone nodes", it)
             }
     }
+
+    /**
+     * Hand the reading to the pump controller on this watch. It keeps basal safe by itself when
+     * the phone is away, and for that it needs glucose without the phone in between.
+     *
+     * Addressed to that one app and no other, and that app accepts it only from an app signed
+     * with the same key. If the controller is not installed, nothing happens.
+     */
+    private fun handToPumpController(context: Context, mgdl: Int, receivedAt: Long, ageSeconds: Int) {
+        runCatching {
+            context.sendBroadcast(
+                Intent(CONTROLLER_GLUCOSE_ACTION)
+                    .setComponent(ComponentName(CONTROLLER_PACKAGE, CONTROLLER_GLUCOSE_RECEIVER))
+                    .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES or Intent.FLAG_RECEIVER_FOREGROUND)
+                    .putExtra("mgdl", mgdl)
+                    .putExtra("timestamp", receivedAt)
+                    .putExtra("ageSeconds", ageSeconds)
+            )
+        }.onFailure { Log.w(TAG, "Reading not handed to the pump controller", it) }
+    }
+
+    private const val CONTROLLER_PACKAGE = "app.aaps.combobench.manual"
+    private const val CONTROLLER_GLUCOSE_RECEIVER = "app.aaps.combobench.controller.ControllerGlucoseReceiver"
+    private const val CONTROLLER_GLUCOSE_ACTION = "app.aaps.combo.action.GLUCOSE"
 
     private const val MIN_GLUCOSE_MGDL = 20
     private const val MAX_GLUCOSE_MGDL = 400

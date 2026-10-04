@@ -10,8 +10,8 @@ android {
         applicationId = "com.example.weartester.watchface"
         minSdk = 34
         targetSdk = 34
-        versionCode = 9
-        versionName = "1.8"
+        versionCode = 13
+        versionName = "1.12"
     }
 
     buildTypes {

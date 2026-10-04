@@ -3,7 +3,14 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Разрешения -->
-    <queries><package android:name="info.nightscout.androidaps" /></queries>
+    <queries>
+        <package android:name="info.nightscout.androidaps" />
+        <!-- The pump controller on this watch, which receives every reading. -->
+        <package android:name="app.aaps.combobench.manual" />
+    </queries>
+    <!-- Defined by the pump controller, signature-level: lets this app, and only an app signed
+         like it, tell the controller what the glucose is. -->
+    <uses-permission android:name="app.aaps.combo.permission.GLUCOSE" />
     <uses-permission android:name="android.permission.BLUETOOTH" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
 

@@ -45,6 +45,7 @@ class DexcomGlucoseComplicationService : ComplicationDataSourceService() {
         val shortText = when {
             unusable -> "--"
             stale -> "OLD"
+            glucose.mgdl != null && glucose.displayOnly -> "${glucose.mgdl}?"
             glucose.mgdl != null -> glucose.mgdl.toString()
             else -> "--"
         }
@@ -63,6 +64,8 @@ class DexcomGlucoseComplicationService : ComplicationDataSourceService() {
             session.glucoseStatus()
         } else if (stale) {
             "Устаревшая глюкоза ${glucose.mgdl}, $compactAge назад"
+        } else if (glucose.mgdl != null && glucose.displayOnly) {
+            "Глюкоза ${glucose.mgdl}, передатчик не подтвердил показание; телефону не передано"
         } else if (glucose.mgdl != null) {
             "Глюкоза ${glucose.mgdl} миллиграмм на децилитр"
         } else {

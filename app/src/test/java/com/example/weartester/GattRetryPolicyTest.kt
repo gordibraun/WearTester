@@ -1,6 +1,8 @@
 package com.example.weartester
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class GattRetryPolicyTest {
@@ -38,6 +40,42 @@ class GattRetryPolicyTest {
         policy.disconnected(133, false, 100_000L)
         policy.connected()
         assertEquals(0L, policy.remainingMs(100_500L))
+    }
+
+    @Test fun anEarly133InsideTheReadingWindowIsAnsweredOnTheNextAdvertisement() {
+        // 4 Oct 11:28: the phone connected 0.13 s before the watch, the watch's connect ended 133
+        // after 1.8 s, the transmitter advertised again 0.9 s later - into the old two-second pause.
+        val policy = GattRetryPolicy()
+        assertTrue(policy.disconnected(133, false, 100_000L, quickRetry = true))
+        assertEquals(0L, policy.remainingMs(100_900L))
+        assertTrue(policy.disconnected(133, false, 103_000L, quickRetry = true))
+        assertEquals(0L, policy.remainingMs(103_100L))
+        // The third early failure of the same window settles as before: 10:18 was four instant 133s.
+        assertFalse(policy.disconnected(133, false, 106_000L, quickRetry = true))
+        assertEquals(2_000L, policy.remainingMs(106_000L))
+    }
+
+    @Test fun quickRetriesAreCountedPerWindow() {
+        val policy = GattRetryPolicy()
+        policy.disconnected(133, false, 100_000L, quickRetry = true)
+        policy.disconnected(133, false, 102_000L, quickRetry = true)
+        assertFalse(policy.disconnected(133, false, 104_000L, quickRetry = true))
+        // The next window, five minutes on, has its own two.
+        assertTrue(policy.disconnected(133, false, 400_000L, quickRetry = true))
+    }
+
+    @Test fun aConnectionStartsTheCountAfresh() {
+        val policy = GattRetryPolicy()
+        policy.disconnected(133, false, 100_000L, quickRetry = true)
+        policy.disconnected(133, false, 102_000L, quickRetry = true)
+        policy.connected()
+        assertTrue(policy.disconnected(133, false, 104_000L, quickRetry = true))
+    }
+
+    @Test fun outsideTheWindowAnEarlyFailureSettlesAsBefore() {
+        val policy = GattRetryPolicy()
+        assertFalse(policy.disconnected(133, false, 100_000L))
+        assertEquals(2_000L, policy.remainingMs(100_000L))
     }
 
     @Test fun september23RapidRetryBurstIsNotRepeated() {

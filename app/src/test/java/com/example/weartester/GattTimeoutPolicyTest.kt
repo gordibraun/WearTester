@@ -8,7 +8,9 @@ class GattTimeoutPolicyTest {
         GattTimeoutPolicy.expiredPhase(attempt, connected, discovered, GattTimeoutPolicy.ADVERTISED_CONNECT_TIMEOUT_MS)
 
     @Test fun stalledLinkDoesNotOccupyTheWholeAdvertisementWindow() {
-        assertNull(phase(7_999))
+        assertNull(phase(5_499))
+        assertEquals(GattTimeoutPolicy.Phase.CONNECTING, phase(5_500))
+        // October 3: eight hung connects, each costing a reading; a second try needs the rest of the ~15 s burst.
         assertEquals(GattTimeoutPolicy.Phase.CONNECTING, phase(8_000))
         // September 23 14:39:37 -> 14:40:08, strong RSSI -62, no connection.
         assertEquals(GattTimeoutPolicy.Phase.CONNECTING, phase(30_312))
@@ -19,6 +21,7 @@ class GattTimeoutPolicyTest {
     }
 
     @Test fun connectionJustBeforeDeadlineGetsItsOwnDiscoveryBudget() {
+        assertNull(phase(5_500, 1))
         assertNull(phase(8_000, 1))
         assertNull(phase(30_312, 25_000))
         assertNull(phase(82_998, 74_999))

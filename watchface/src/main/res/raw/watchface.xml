@@ -2,50 +2,43 @@
 <WatchFace width="450" height="450">
     <Scene backgroundColor="#000000">
         <Group name="static_text" x="0" y="0" width="450" height="450">
-            <DigitalClock x="0" y="28" width="450" height="80">
-                <TimeText x="0" y="0" width="450" height="80" format="hh:mm">
+            <DigitalClock x="0" y="18" width="450" height="76">
+                <TimeText x="0" y="0" width="450" height="76" format="hh:mm">
                     <Font family="SYNC_TO_DEVICE" size="66" color="#FFFFFF" />
                 </TimeText>
             </DigitalClock>
 
-            <PartText x="0" y="277" width="450" height="26" alpha="255">
-                <Text align="CENTER">
-                    <Font family="SYNC_TO_DEVICE" size="20" color="#4DD0E1">
-                        <![CDATA[mg/dL]]>
-                    </Font>
-                </Text>
-            </PartText>
         </Group>
 
         <ComplicationSlot
             slotId="0"
             x="70"
-            y="142"
+            y="118"
             width="310"
-            height="132"
+            height="118"
             name="glucose"
             displayName="@string/glucose_slot_name"
             supportedTypes="SHORT_TEXT EMPTY"
             isCustomizable="TRUE">
-            <BoundingOval x="0" y="0" width="310" height="132" />
+            <BoundingOval x="0" y="0" width="310" height="118" />
             <DefaultProviderPolicy
                 primaryProvider="com.example.weartester/com.example.weartester.DexcomGlucoseComplicationService"
                 primaryProviderType="SHORT_TEXT"
                 defaultSystemProvider="WATCH_BATTERY"
                 defaultSystemProviderType="SHORT_TEXT" />
             <Complication type="SHORT_TEXT">
-                <Group name="glucose_value" x="0" y="0" width="310" height="132">
-                    <PartText x="0" y="0" width="310" height="98" alpha="255">
+                <Group name="glucose_value" x="0" y="0" width="310" height="118">
+                    <PartText x="0" y="0" width="310" height="90" alpha="255">
                         <Text align="CENTER">
-                            <Font family="SYNC_TO_DEVICE" size="100" weight="BOLD" color="#7CFF7C">
+                            <Font family="SYNC_TO_DEVICE" size="92" weight="BOLD" color="#7CFF7C">
                                 <Template><![CDATA[%s]]><Parameter expression="[COMPLICATION.TEXT]" /></Template>
                             </Font>
                         </Text>
                     </PartText>
 
-                    <PartText x="0" y="102" width="310" height="30" alpha="255">
+                    <PartText x="0" y="90" width="310" height="28" alpha="255">
                         <Text align="CENTER">
-                            <Font family="SYNC_TO_DEVICE" size="26" color="#B0BEC5">
+                            <Font family="SYNC_TO_DEVICE" size="24" color="#B0BEC5">
                                 <Template><![CDATA[%s]]><Parameter expression="[COMPLICATION.TITLE]" /></Template>
                             </Font>
                         </Text>
@@ -54,8 +47,8 @@
             </Complication>
 
             <Complication type="EMPTY">
-                <Group name="glucose_empty" x="0" y="0" width="310" height="132">
-                    <PartText x="0" y="8" width="310" height="90" alpha="255">
+                <Group name="glucose_empty" x="0" y="0" width="310" height="118">
+                    <PartText x="0" y="4" width="310" height="86" alpha="255">
                         <Text align="CENTER">
                             <Font family="SYNC_TO_DEVICE" size="86" weight="BOLD" color="#90A4AE">
                                 <![CDATA[--]]>
@@ -63,9 +56,9 @@
                         </Text>
                     </PartText>
 
-                    <PartText x="0" y="102" width="310" height="30" alpha="255">
+                    <PartText x="0" y="90" width="310" height="28" alpha="255">
                         <Text align="CENTER">
-                            <Font family="SYNC_TO_DEVICE" size="26" color="#B0BEC5">
+                            <Font family="SYNC_TO_DEVICE" size="24" color="#B0BEC5">
                                 <![CDATA[waiting Dexcom]]>
                             </Font>
                         </Text>
@@ -74,7 +67,7 @@
             </Complication>
         </ComplicationSlot>
 
-        <ComplicationSlot slotId="1" x="50" y="110" width="350" height="28"
+        <ComplicationSlot slotId="1" x="50" y="94" width="350" height="28"
             name="sensor_expiry" displayName="@string/sensor_expiry_slot_name"
             supportedTypes="LONG_TEXT EMPTY" isCustomizable="TRUE">
             <BoundingBox x="0" y="0" width="350" height="28" />
@@ -106,37 +99,108 @@
             </Complication>
         </ComplicationSlot>
 
-        <Group name="carbs_shortcut" x="80" y="310" width="135" height="82">
+        <!-- The graph from the pump controller: the last hour of readings, the three-hour forecast, insulin on board, the trend. -->
+        <ComplicationSlot slotId="2" x="55" y="238" width="340" height="86"
+            name="graph" displayName="@string/graph_slot_name"
+            supportedTypes="SMALL_IMAGE EMPTY" isCustomizable="TRUE">
+            <BoundingBox x="0" y="0" width="340" height="86" />
+            <DefaultProviderPolicy primaryProvider="app.aaps.combobench.manual/app.aaps.combobench.controller.GraphComplicationService"
+                primaryProviderType="SMALL_IMAGE" defaultSystemProvider="EMPTY" defaultSystemProviderType="EMPTY" />
+            <Complication type="SMALL_IMAGE">
+                <PartImage x="0" y="0" width="340" height="86">
+                    <Image resource="[COMPLICATION.SMALL_IMAGE]" />
+                </PartImage>
+            </Complication>
+            <Complication type="EMPTY">
+                <PartText x="0" y="28" width="340" height="30">
+                    <Text align="CENTER"><Font family="SYNC_TO_DEVICE" size="20" color="#4DD0E1">график —</Font></Text>
+                </PartText>
+            </Complication>
+        </ComplicationSlot>
+
+        <!-- The pump now: temporary basal and the minutes it has left, or the profile basal. -->
+        <ComplicationSlot slotId="3" x="55" y="326" width="160" height="46"
+            name="pump" displayName="@string/pump_slot_name"
+            supportedTypes="SHORT_TEXT EMPTY" isCustomizable="TRUE">
+            <BoundingBox x="0" y="0" width="160" height="46" />
+            <DefaultProviderPolicy primaryProvider="app.aaps.combobench.manual/app.aaps.combobench.controller.PumpComplicationService"
+                primaryProviderType="SHORT_TEXT" defaultSystemProvider="EMPTY" defaultSystemProviderType="EMPTY" />
+            <Complication type="SHORT_TEXT">
+                <PartText x="0" y="0" width="160" height="28">
+                    <Text align="CENTER"><Font family="SYNC_TO_DEVICE" size="26" weight="BOLD" color="#FFFFFF">
+                        <Template><![CDATA[%s]]><Parameter expression="[COMPLICATION.TEXT]" /></Template>
+                    </Font></Text>
+                </PartText>
+                <PartText x="0" y="28" width="160" height="18">
+                    <Text align="CENTER"><Font family="SYNC_TO_DEVICE" size="16" color="#9AA5AE">
+                        <Template><![CDATA[%s]]><Parameter expression="[COMPLICATION.TITLE]" /></Template>
+                    </Font></Text>
+                </PartText>
+            </Complication>
+            <Complication type="EMPTY">
+                <PartText x="0" y="8" width="160" height="30">
+                    <Text align="CENTER"><Font family="SYNC_TO_DEVICE" size="18" color="#9AA5AE">помпа —</Font></Text>
+                </PartText>
+            </Complication>
+        </ComplicationSlot>
+
+        <!-- The link: who commands ("помпа ✓" with the phone, "часы ✓" when the watch is on its own) over how long since the phone was heard ("тел 2м"). -->
+        <ComplicationSlot slotId="4" x="235" y="326" width="160" height="46"
+            name="link" displayName="@string/link_slot_name"
+            supportedTypes="SHORT_TEXT EMPTY" isCustomizable="TRUE">
+            <BoundingBox x="0" y="0" width="160" height="46" />
+            <DefaultProviderPolicy primaryProvider="app.aaps.combobench.manual/app.aaps.combobench.controller.LinkComplicationService"
+                primaryProviderType="SHORT_TEXT" defaultSystemProvider="EMPTY" defaultSystemProviderType="EMPTY" />
+            <Complication type="SHORT_TEXT">
+                <PartText x="0" y="0" width="160" height="28">
+                    <Text align="CENTER"><Font family="SYNC_TO_DEVICE" size="24" weight="BOLD" color="#FFFFFF">
+                        <Template><![CDATA[%s]]><Parameter expression="[COMPLICATION.TEXT]" /></Template>
+                    </Font></Text>
+                </PartText>
+                <PartText x="0" y="28" width="160" height="18">
+                    <Text align="CENTER"><Font family="SYNC_TO_DEVICE" size="16" color="#9AA5AE">
+                        <Template><![CDATA[%s]]><Parameter expression="[COMPLICATION.TITLE]" /></Template>
+                    </Font></Text>
+                </PartText>
+            </Complication>
+            <Complication type="EMPTY">
+                <PartText x="0" y="8" width="160" height="30">
+                    <Text align="CENTER"><Font family="SYNC_TO_DEVICE" size="18" color="#9AA5AE">связь —</Font></Text>
+                </PartText>
+            </Complication>
+        </ComplicationSlot>
+
+        <Group name="carbs_shortcut" x="130" y="376" width="92" height="50">
             <Variant mode="AMBIENT" target="alpha" value="0" />
-            <PartDraw x="0" y="0" width="135" height="82">
-                <RoundRectangle x="0" y="0" width="135" height="82" cornerRadiusX="8" cornerRadiusY="8">
+            <PartDraw x="0" y="0" width="92" height="50">
+                <RoundRectangle x="0" y="0" width="92" height="50" cornerRadiusX="8" cornerRadiusY="8">
                     <Fill color="#181818" />
                 </RoundRectangle>
                 <Launch target="info.nightscout.androidaps/app.aaps.wear.interaction.actions.WatchCarbsShortcut" />
             </PartDraw>
-            <PartImage x="48" y="8" width="40" height="40" tintColor="#FFB74D">
+            <PartImage x="34" y="2" width="24" height="24" tintColor="#FFB74D">
                 <Image resource="ic_wheat" />
                 <Launch target="info.nightscout.androidaps/app.aaps.wear.interaction.actions.WatchCarbsShortcut" />
             </PartImage>
-            <PartText x="0" y="52" width="135" height="26">
-                <Text align="CENTER"><Font family="SYNC_TO_DEVICE" size="22" color="#FFB74D">Углеводы</Font></Text>
+            <PartText x="0" y="27" width="92" height="20">
+                <Text align="CENTER"><Font family="SYNC_TO_DEVICE" size="16" color="#FFB74D">Углеводы</Font></Text>
                 <Launch target="info.nightscout.androidaps/app.aaps.wear.interaction.actions.WatchCarbsShortcut" />
             </PartText>
         </Group>
-        <Group name="activity_shortcut" x="235" y="310" width="135" height="82">
+        <Group name="activity_shortcut" x="228" y="376" width="92" height="50">
             <Variant mode="AMBIENT" target="alpha" value="0" />
-            <PartDraw x="0" y="0" width="135" height="82">
-                <RoundRectangle x="0" y="0" width="135" height="82" cornerRadiusX="8" cornerRadiusY="8">
+            <PartDraw x="0" y="0" width="92" height="50">
+                <RoundRectangle x="0" y="0" width="92" height="50" cornerRadiusX="8" cornerRadiusY="8">
                     <Fill color="#181818" />
                 </RoundRectangle>
                 <Launch target="info.nightscout.androidaps/app.aaps.wear.interaction.actions.WatchActivityShortcut" />
             </PartDraw>
-            <PartImage x="48" y="8" width="40" height="40" tintColor="#4DD0E1">
+            <PartImage x="34" y="2" width="24" height="24" tintColor="#4DD0E1">
                 <Image resource="ic_footprints" />
                 <Launch target="info.nightscout.androidaps/app.aaps.wear.interaction.actions.WatchActivityShortcut" />
             </PartImage>
-            <PartText x="0" y="52" width="135" height="26">
-                <Text align="CENTER"><Font family="SYNC_TO_DEVICE" size="22" color="#4DD0E1">Нагрузка</Font></Text>
+            <PartText x="0" y="27" width="92" height="20">
+                <Text align="CENTER"><Font family="SYNC_TO_DEVICE" size="16" color="#4DD0E1">Нагрузка</Font></Text>
                 <Launch target="info.nightscout.androidaps/app.aaps.wear.interaction.actions.WatchActivityShortcut" />
             </PartText>
         </Group>

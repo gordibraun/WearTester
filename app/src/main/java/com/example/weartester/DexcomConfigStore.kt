@@ -23,6 +23,8 @@ data class GlucoseReadingState(
     val dexTimestamp: Int,
     val ageSeconds: Int,
     val source: String,
+    /** The transmitter showed this value but did not vouch for it; shown on the face, handed to nobody. */
+    val displayOnly: Boolean = false,
 )
 
 object DexcomConfigStore {
@@ -41,6 +43,7 @@ object DexcomConfigStore {
     private const val KEY_GLUCOSE_DEX_TIMESTAMP = "glucose_dex_timestamp"
     private const val KEY_GLUCOSE_AGE_SECONDS = "glucose_age_seconds"
     private const val KEY_GLUCOSE_SOURCE = "glucose_source"
+    private const val KEY_GLUCOSE_DISPLAY_ONLY = "glucose_display_only"
     private const val KEY_DIRECT_GLUCOSE_MGDL = "direct_glucose_mgdl"
     private const val KEY_DIRECT_GLUCOSE_RECEIVED_AT_MILLIS = "direct_glucose_received_at_millis"
     private const val KEY_DIRECT_GLUCOSE_DEX_TIMESTAMP = "direct_glucose_dex_timestamp"
@@ -176,7 +179,30 @@ object DexcomConfigStore {
             dexTimestamp = prefs.getInt(KEY_GLUCOSE_DEX_TIMESTAMP, 0),
             ageSeconds = prefs.getInt(KEY_GLUCOSE_AGE_SECONDS, 0),
             source = prefs.getString(KEY_GLUCOSE_SOURCE, "") ?: "",
+            displayOnly = prefs.getBoolean(KEY_GLUCOSE_DISPLAY_ONLY, false),
         )
+    }
+
+    /**
+     * A value the transmitter marked "display only": it shows it but does not vouch for it (the
+     * first readings of a session, around calibrations, after a jump). Kept for the face only -
+     * the direct reading, which is what goes to the phone and the pump controller, is left as it
+     * was, so nobody downstream acts on a number Dexcom itself would not act on.
+     */
+    fun saveDisplayOnlyGlucose(context: Context, mgdl: Int, dexTimestamp: Int, ageSeconds: Int, source: String) {
+        require(mgdl in 20..600) { "Sensor status code is not glucose" }
+        val receivedAtMillis = System.currentTimeMillis()
+        ConnectionJournal.record(context, "display_only_glucose", "value" to mgdl, "sample_age_seconds" to ageSeconds)
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit()
+            .putInt(KEY_GLUCOSE_MGDL, mgdl)
+            .putLong(KEY_GLUCOSE_RECEIVED_AT_MILLIS, receivedAtMillis)
+            .putInt(KEY_GLUCOSE_DEX_TIMESTAMP, dexTimestamp)
+            .putInt(KEY_GLUCOSE_AGE_SECONDS, ageSeconds)
+            .putString(KEY_GLUCOSE_SOURCE, source)
+            .putBoolean(KEY_GLUCOSE_DISPLAY_ONLY, true)
+            .apply()
+        appendEvent(prefs, receivedAtMillis, "display-only glucose ${mgdl} mg/dL source=$source dexTs=$dexTimestamp age=${ageSeconds}s")
     }
 
     private fun loadDirectGlucose(
@@ -312,6 +338,7 @@ object DexcomConfigStore {
             .putInt(KEY_GLUCOSE_DEX_TIMESTAMP, dexTimestamp)
             .putInt(KEY_GLUCOSE_AGE_SECONDS, ageSeconds)
             .putString(KEY_GLUCOSE_SOURCE, source)
+            .putBoolean(KEY_GLUCOSE_DISPLAY_ONLY, false)
             .apply()
     }
 
