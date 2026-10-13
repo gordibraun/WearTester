@@ -2513,9 +2513,9 @@ class BondProbeService : Service() {
 
         override fun onBondRequired(device: BluetoothDevice) {
             wakePairingScreen(device)
-            val created = runCatching {
-                device.javaClass.getMethod("createBond", Int::class.javaPrimitiveType).invoke(device, BluetoothDevice.TRANSPORT_LE) as Boolean
-            }.getOrElse { runCatching { device.createBond() }.getOrDefault(false) }
+            // The public call only. The hidden createBond(transport) with TRANSPORT_LE crashes this
+            // watch's Bluetooth process (null native hook, 13 Oct 2026); the G6 bonds the same way.
+            val created = runCatching { device.createBond() }.getOrDefault(false)
             Log.i(TAG, "G7 createBond -> $created")
             ConnectionJournal.record(this@BondProbeService, "g7_create_bond", "issued" to created)
             if (!created) alertPairingNeeded(device)
