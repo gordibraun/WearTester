@@ -2126,8 +2126,10 @@ class BondProbeService : Service() {
                     .setDeviceAddress(knownMac)
                     .build()
             }
-            if (config.isG7 && filters.isEmpty()) {
-                // An unknown G7 is found by the service every Dexcom advertises; its name is learnt at pairing.
+            if (config.isG7) {
+                // The G7 advertises from a random-type address, which the plain address filter
+                // does not match (nothing was seen for ten minutes on 13 Oct); the service UUID
+                // every Dexcom advertises always passes it, and the callback matches precisely.
                 filters += ScanFilter.Builder()
                     .setServiceUuid(DEXCOM_ADVERTISED_SERVICE)
                     .build()
