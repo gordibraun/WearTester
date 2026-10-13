@@ -31,6 +31,7 @@ import android.content.Intent
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.ParcelUuid
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -138,6 +139,12 @@ class BondProbeService : Service() {
         private const val CONNECTED_SESSION_WITHOUT_GLUCOSE_TIMEOUT_MS = 120_000L
         private const val CONNECTED_SENSOR_REFRESH_MS = DEXCOM_READING_PERIOD_MS + 2_000L
         private const val CONNECTED_SENSOR_REFRESH_RETRY_MS = 12_000L
+        /** A first G7 pairing waits on three key rounds, two certificates and the user's bond confirmation. */
+        private const val G7_PAIRING_SESSION_TIMEOUT_MS = 4 * 60_000L
+        /** A G7 that rejected our pairing code is someone else's, or the code is wrong: leave it alone for a while. */
+        private const val G7_REJECTED_ADDRESS_MS = 10 * 60_000L
+        private const val G7_RAW_NAME_HEX = "4458434D"
+        private val DEXCOM_ADVERTISED_SERVICE: ParcelUuid = ParcelUuid.fromString("0000febc-0000-1000-8000-00805f9b34fb")
         private const val DEXCOM_TIMESTAMP_RESET_ACCEPT_SECONDS = 60 * 60
         private const val POST_GLUCOSE_DUPLICATE_SUPPRESSION_MS = 2 * 60_000L
         private const val BROAD_SCAN_SILENT_RESTART_MS = 25_000L
@@ -179,6 +186,11 @@ class BondProbeService : Service() {
     private var authCharacteristic: BluetoothGattCharacteristic? = null
     private var controlCharacteristic: BluetoothGattCharacteristic? = null
     private var authRequestToken: ByteArray? = null
+    @Volatile private var g7Session: G7Session? = null
+    /** The G7's advertised name at the match that led to the current connection ("DXCMxx"). */
+    @Volatile private var g7MatchedName: String? = null
+    private val g7RejectedUntilMillis = HashMap<String, Long>()
+    private var g7RejectionsForCode = ""
     @Volatile private var bondFlowStarted = false
     @Volatile private var sensorRequestSent = false
     @Volatile private var reconnectDelayMs = RECONNECT_DELAY_MS
@@ -516,6 +528,10 @@ class BondProbeService : Service() {
             }
             val activeGatt = gatt ?: return
             if (!device.address.equals(activeGatt.device.address, ignoreCase = true)) return
+            g7Session?.let { session ->
+                synchronized(gattLock) { session.onBondStateChanged(bondState) }
+                return
+            }
             if (device.bondState == BluetoothDevice.BOND_BONDED && waitingBondConfirmation == 1) {
                 waitingBondConfirmation = 2
                 Log.i(TAG, "Bond confirmation received from system")
@@ -939,20 +955,24 @@ class BondProbeService : Service() {
 
                 handlePendingBleSessionRecovery()
 
-                if (transmitterId.isBlank()) {
-                    updateNotif("Укажите код трансмиттера в настройках")
-                    Log.w(TAG, "No transmitter ID configured")
+                if (!config.isConfigured) {
+                    updateNotif(if (config.isG7) "Укажите код сопряжения G7 в настройках" else "Укажите код трансмиттера в настройках")
+                    Log.w(TAG, "No transmitter ID / pairing code configured")
                     DexcomConfigStore.saveScanDebug(this, "", "", null, "missing transmitter id")
                     sleep(reconnectDelayMs)
                     continue
+                }
+                if (config.isG7 && g7RejectionsForCode != config.g7PairingCode) {
+                    synchronized(g7RejectedUntilMillis) { g7RejectedUntilMillis.clear() }
+                    g7RejectionsForCode = config.g7PairingCode
                 }
 
                 if (knownMac.isNotEmpty()) {
                     Log.i(TAG, "Known MAC $knownMac configured; using scan-first collector on watch")
                 }
 
-                Log.i(TAG, "Start BLE scan for $SCAN_MS ms (prefix=$NAME_PREFIX, txid=$transmitterId)")
-                updateNotif("Сканирую Dexcom ${transmitterId.ifBlank { "" }}")
+                Log.i(TAG, "Start BLE scan for $SCAN_MS ms (prefix=$NAME_PREFIX, txid=$transmitterId, model=${config.sensorModel})")
+                updateNotif(if (config.isG7) "Сканирую G7 ${config.g7SensorName.ifBlank { "(код ${config.g7PairingCode})" }}" else "Сканирую Dexcom ${transmitterId.ifBlank { "" }}")
                 DexcomConfigStore.saveScanDebug(this, "", "", null, "scan started for $transmitterId")
                 if (!startScanInternal()) {
                     sleep(reconnectDelayMs)
@@ -1032,7 +1052,8 @@ class BondProbeService : Service() {
             val connectedGatt = gatt
             if (connectedAt > 0L && lastSensorContactAtMillis < connectedAt) {
                 val connectedAge = System.currentTimeMillis() - connectedAt
-                if (connectedAge >= CONNECTED_SESSION_WITHOUT_GLUCOSE_TIMEOUT_MS) {
+                val sessionLimit = if (g7Session?.pairingInProgress == true) G7_PAIRING_SESSION_TIMEOUT_MS else CONNECTED_SESSION_WITHOUT_GLUCOSE_TIMEOUT_MS
+                if (connectedAge >= sessionLimit) {
                     Log.w(TAG, "Connected for ${connectedAge}ms without glucose; restarting watch-primary Dexcom session")
                     DexcomConfigStore.saveScanDebug(
                         this,
@@ -1070,6 +1091,14 @@ class BondProbeService : Service() {
 
         lastSensorRequestAtMillis = now
         sensorRequestSent = false
+        val g7 = g7Session
+        if (g7 != null) {
+            if (g7.phase != G7Session.Phase.GET_DATA) return
+            Log.i(TAG, "Connected G7 refresh: requesting glucose age=${glucoseAge}ms")
+            sensorRequestSent = true
+            g7.requestGlucose()
+            return
+        }
         Log.i(TAG, "Connected Dexcom refresh: requesting glucose age=${glucoseAge}ms")
         DexcomConfigStore.saveScanDebug(
             this,
@@ -1241,10 +1270,11 @@ class BondProbeService : Service() {
             else -> return false
         }
         val activeAge = now - activeSince
+        val connectedNoGlucoseLimit = if (g7Session?.pairingInProgress == true) G7_PAIRING_SESSION_TIMEOUT_MS else WATCHDOG_CONNECTED_WITHOUT_GLUCOSE_MS
         val connectedNoGlucose = servicesDiscovered &&
             connectedAt > 0L &&
             lastSensorContactAtMillis < connectedAt &&
-            activeAge >= WATCHDOG_CONNECTED_WITHOUT_GLUCOSE_MS
+            activeAge >= connectedNoGlucoseLimit
         val hardStuck = activeAge >= WATCHDOG_ACTIVE_GATT_HARD_MS
         if (!connectedNoGlucose && !hardStuck) return false
 
@@ -1704,6 +1734,10 @@ class BondProbeService : Service() {
             weakGattFailureGuardUntilMillis = 0L
             resetWeakMatchCandidate()
             gattConnectStartedAtMillis = 0L
+            if (config.isG7) {
+                startG7Session(g)
+                return
+            }
             cacheDexcomCharacteristics(g.services)
             readAuthCharacteristic(g)
         }
@@ -1715,6 +1749,10 @@ class BondProbeService : Service() {
             }
             val value = ch.value ?: byteArrayOf()
             Log.i(TAG, "onCharacteristicChanged: ${ch.uuid} len=${value.size} hex=${value.toHex()}")
+            g7Session?.let { session ->
+                session.onCharacteristicChanged(ch, value)
+                return
+            }
             if (ch.uuid == authCharacteristic?.uuid && value.isNotEmpty()) {
                 if (value[0].toInt() and 0xFF == 0x06) {
                     Log.i(TAG, "KeepAlive response received: ${value.toHex()}")
@@ -1734,117 +1772,7 @@ class BondProbeService : Service() {
                     AUTH_OPCODE_TIME_RX -> handleTransmitterTime(g, value)
                     AUTH_OPCODE_SESSION_START_RX -> handleSessionStart(g, value)
                     SENSOR_OPCODE, GLUCOSE_OPCODE, E_GLUCOSE_OPCODE, E_GLUCOSE2_OPCODE -> {
-                        val opcode = value[0].toInt() and 0xFF
-                        runCatching { SensorProtocol.reading(value) }
-                            .onSuccess { sensor ->
-                                lastSensorContactAtMillis = System.currentTimeMillis()
-                                SensorSessionStore.recordReading(this@BondProbeService, sensor, lastSensorContactAtMillis)
-                                earlyGattFailureCount = 0
-                                consecutiveSilentBroadScanRestarts = 0
-                                sensorRequestSent = false
-                                if (!sensor.usable) {
-                                    if (sensor.displayOnly && sensor.state in setOf(6, 7) && sensor.glucose in 20..600 && sensor.ageSeconds < 305) {
-                                        // Shown with a mark on the face; not handed to the phone or the pump controller.
-                                        Log.i(TAG, "display-only glucose ${sensor.glucose} mg/dL; shown, not forwarded")
-                                        DexcomConfigStore.saveDisplayOnlyGlucose(
-                                            this@BondProbeService, sensor.glucose, sensor.timestamp, sensor.ageSeconds,
-                                            "opcode=0x${opcode.toString(16).uppercase()} display-only",
-                                        )
-                                        updateNotif("Dexcom: ${sensor.glucose} (не подтверждено передатчиком)")
-                                        requestComplicationRefresh("display-only glucose", force = true)
-                                        scheduleNextReadingWindowAlarm("display-only glucose")
-                                        releaseReadingWindowWakeLock("display-only glucose received")
-                                        keepGattAfterGlucose(g)
-                                        return@onSuccess
-                                    }
-                                    val status = SensorSessionStore.load(this@BondProbeService).glucoseStatus()
-                                    updateNotif(status)
-                                    requestComplicationRefresh("sensor status", force = true)
-                                    scheduleNextReadingWindowAlarm("sensor status")
-                                    releaseReadingWindowWakeLock("sensor status received")
-                                    keepGattAfterGlucose(g)
-                                    return@onSuccess
-                                }
-                                val previousDirect = DexcomConfigStore.loadDirectGlucose(this@BondProbeService)
-                                val timestampRollbackSeconds = previousDirect.dexTimestamp - sensor.timestamp
-                                val looksLikeNewTransmitterTimeline =
-                                    timestampRollbackSeconds >= DEXCOM_TIMESTAMP_RESET_ACCEPT_SECONDS
-                                if (
-                                    previousDirect.dexTimestamp > 0 &&
-                                    sensor.timestamp <= previousDirect.dexTimestamp &&
-                                    !looksLikeNewTransmitterTimeline
-                                ) {
-                                    sensorRequestSent = false
-                                    val event = "duplicate glucose ${sensor.glucose} mg/dL opcode=0x${opcode.toString(16).uppercase()} ts=${sensor.timestamp} currentTs=${previousDirect.dexTimestamp}"
-                                    Log.i(TAG, event)
-                                    DexcomConfigStore.saveScanDebug(
-                                        this@BondProbeService,
-                                        "Dexcom connected",
-                                        g.device?.address ?: "",
-                                        null,
-                                        event,
-                                    )
-                                    updateNotif("Dexcom: жду свежий пакет")
-                                    maybeEnsureReadingWindowWakeLock("duplicate glucose")
-                                    keepGattAfterGlucose(g)
-                                    return@onSuccess
-                                }
-                                if (looksLikeNewTransmitterTimeline) {
-                                    val resetEvent =
-                                        "dex timestamp reset accepted ${previousDirect.dexTimestamp}->${sensor.timestamp}; treating as new transmitter/session"
-                                    Log.w(TAG, resetEvent)
-                                    DexcomConfigStore.saveScanDebug(
-                                        this@BondProbeService,
-                                        "Dexcom connected",
-                                        g.device?.address ?: "",
-                                        null,
-                                        resetEvent,
-                                    )
-                                }
-                                lastSensorContactAtMillis = System.currentTimeMillis()
-                                earlyGattFailureCount = 0
-                                consecutiveSilentBroadScanRestarts = 0
-                                sensorRequestSent = false
-                                lastSensorRequestAtMillis = 0L
-                                preferScanUntilMillis = lastSensorContactAtMillis + PREFER_SCAN_AFTER_SUCCESS_MS
-                                forceBroadScanUntilMillis = 0L
-                                releaseReadingWindowWakeLock("glucose received")
-                                val event = "GLUCOSE ${sensor.glucose} mg/dL opcode=0x${opcode.toString(16).uppercase()} ts=${sensor.timestamp} age=${sensor.ageSeconds}"
-                                Log.i(TAG, event)
-                                val directReading = DexcomConfigStore.saveGlucose(
-                                    this@BondProbeService,
-                                    sensor.glucose,
-                                    sensor.timestamp,
-                                    sensor.ageSeconds,
-                                    "opcode=0x${opcode.toString(16).uppercase()}",
-                                )
-                                GlucoseSyncBridge.sendWatchGlucose(
-                                    context = this@BondProbeService,
-                                    reading = directReading,
-                                    transmitterId = config.transmitterId,
-                                )
-                                requestComplicationRefresh("glucose packet", force = true)
-                                updateNotif("Глюкоза ${sensor.glucose} mg/dL")
-                                scheduleNextReadingWindowAlarm("glucose packet")
-                                DexcomConfigStore.saveScanDebug(
-                                    this@BondProbeService,
-                                    "Dexcom connected",
-                                    g.device?.address ?: "",
-                                    null,
-                                    event,
-                                )
-                                keepGattAfterGlucose(g)
-                            }
-                            .onFailure { error ->
-                                Log.e(TAG, "Failed to parse glucose-like packet opcode=0x${opcode.toString(16).uppercase()} hex=${value.toHex()}", error)
-                                DexcomConfigStore.saveScanDebug(
-                                    this@BondProbeService,
-                                    "Dexcom parse error",
-                                    g.device?.address ?: "",
-                                    null,
-                                    "glucose parse error opcode=0x${opcode.toString(16).uppercase()} hex=${value.toHex()}",
-                                )
-                            }
+                        processSensorReading(g, value)
                     }
                     else -> Log.i(TAG, "Unhandled control indication opcode=${value[0].toInt() and 0xFF}")
                 }
@@ -1885,6 +1813,10 @@ class BondProbeService : Service() {
                 return
             }
             Log.i(TAG, "onDescriptorWrite: ${descriptor.characteristic.uuid} status=$status")
+            g7Session?.let { session ->
+                session.onDescriptorWrite(descriptor, status)
+                return
+            }
             if (status != BluetoothGatt.GATT_SUCCESS) return
             if (descriptor.characteristic.uuid == authCharacteristic?.uuid) {
                 sendAuthRequest(g)
@@ -1909,6 +1841,10 @@ class BondProbeService : Service() {
             }
             val value = ch.value ?: byteArrayOf()
             Log.i(TAG, "onCharacteristicWrite: uuid=${ch.uuid} status=$status hex=${value.toHex()}")
+            g7Session?.let { session ->
+                session.onCharacteristicWrite(ch, status)
+                return
+            }
             if (status != BluetoothGatt.GATT_SUCCESS) return
             if (ch.uuid == authCharacteristic?.uuid && keepAliveInFlight) {
                 Log.i(TAG, "KeepAlive write complete; sending bond request next")
@@ -1923,6 +1859,123 @@ class BondProbeService : Service() {
             }
             Log.d(TAG, "RSSI=$rssi status=$status")
         }
+    }
+
+    /** A calibrated glucose packet from either sensor model: kept, shown, forwarded, journaled. */
+    private fun processSensorReading(g: BluetoothGatt, value: ByteArray) {
+        val opcode = value[0].toInt() and 0xFF
+        runCatching { SensorProtocol.reading(value) }
+            .onSuccess { sensor ->
+                lastSensorContactAtMillis = System.currentTimeMillis()
+                SensorSessionStore.recordReading(this@BondProbeService, sensor, lastSensorContactAtMillis)
+                earlyGattFailureCount = 0
+                consecutiveSilentBroadScanRestarts = 0
+                sensorRequestSent = false
+                if (!sensor.usable) {
+                    if (sensor.displayOnly && sensor.state in setOf(6, 7) && sensor.glucose in 20..600 && sensor.ageSeconds < 305) {
+                        // Shown with a mark on the face; not handed to the phone or the pump controller.
+                        Log.i(TAG, "display-only glucose ${sensor.glucose} mg/dL; shown, not forwarded")
+                        DexcomConfigStore.saveDisplayOnlyGlucose(
+                            this@BondProbeService, sensor.glucose, sensor.timestamp, sensor.ageSeconds,
+                            "opcode=0x${opcode.toString(16).uppercase()} display-only",
+                        )
+                        updateNotif("Dexcom: ${sensor.glucose} (не подтверждено передатчиком)")
+                        requestComplicationRefresh("display-only glucose", force = true)
+                        scheduleNextReadingWindowAlarm("display-only glucose")
+                        releaseReadingWindowWakeLock("display-only glucose received")
+                        keepGattAfterGlucose(g)
+                        return@onSuccess
+                    }
+                    val status = SensorSessionStore.load(this@BondProbeService).glucoseStatus()
+                    updateNotif(status)
+                    requestComplicationRefresh("sensor status", force = true)
+                    scheduleNextReadingWindowAlarm("sensor status")
+                    releaseReadingWindowWakeLock("sensor status received")
+                    keepGattAfterGlucose(g)
+                    return@onSuccess
+                }
+                val previousDirect = DexcomConfigStore.loadDirectGlucose(this@BondProbeService)
+                val timestampRollbackSeconds = previousDirect.dexTimestamp - sensor.timestamp
+                val looksLikeNewTransmitterTimeline =
+                    timestampRollbackSeconds >= DEXCOM_TIMESTAMP_RESET_ACCEPT_SECONDS
+                if (
+                    previousDirect.dexTimestamp > 0 &&
+                    sensor.timestamp <= previousDirect.dexTimestamp &&
+                    !looksLikeNewTransmitterTimeline
+                ) {
+                    sensorRequestSent = false
+                    val event = "duplicate glucose ${sensor.glucose} mg/dL opcode=0x${opcode.toString(16).uppercase()} ts=${sensor.timestamp} currentTs=${previousDirect.dexTimestamp}"
+                    Log.i(TAG, event)
+                    DexcomConfigStore.saveScanDebug(
+                        this@BondProbeService,
+                        "Dexcom connected",
+                        g.device?.address ?: "",
+                        null,
+                        event,
+                    )
+                    updateNotif("Dexcom: жду свежий пакет")
+                    maybeEnsureReadingWindowWakeLock("duplicate glucose")
+                    keepGattAfterGlucose(g)
+                    return@onSuccess
+                }
+                if (looksLikeNewTransmitterTimeline) {
+                    val resetEvent =
+                        "dex timestamp reset accepted ${previousDirect.dexTimestamp}->${sensor.timestamp}; treating as new transmitter/session"
+                    Log.w(TAG, resetEvent)
+                    DexcomConfigStore.saveScanDebug(
+                        this@BondProbeService,
+                        "Dexcom connected",
+                        g.device?.address ?: "",
+                        null,
+                        resetEvent,
+                    )
+                }
+                lastSensorContactAtMillis = System.currentTimeMillis()
+                earlyGattFailureCount = 0
+                consecutiveSilentBroadScanRestarts = 0
+                sensorRequestSent = false
+                lastSensorRequestAtMillis = 0L
+                preferScanUntilMillis = lastSensorContactAtMillis + PREFER_SCAN_AFTER_SUCCESS_MS
+                forceBroadScanUntilMillis = 0L
+                releaseReadingWindowWakeLock("glucose received")
+                val event = "GLUCOSE ${sensor.glucose} mg/dL opcode=0x${opcode.toString(16).uppercase()} ts=${sensor.timestamp} age=${sensor.ageSeconds}"
+                Log.i(TAG, event)
+                val directReading = DexcomConfigStore.saveGlucose(
+                    this@BondProbeService,
+                    sensor.glucose,
+                    sensor.timestamp,
+                    sensor.ageSeconds,
+                    "opcode=0x${opcode.toString(16).uppercase()}",
+                )
+                GlucoseSyncBridge.sendWatchGlucose(
+                    context = this@BondProbeService,
+                    reading = directReading,
+                    transmitterId = config.sensorIdentity,
+                    sensorModel = config.sensorModel.name,
+                )
+                requestComplicationRefresh("glucose packet", force = true)
+                updateNotif("Глюкоза ${sensor.glucose} mg/dL")
+                scheduleNextReadingWindowAlarm("glucose packet")
+                DexcomConfigStore.saveScanDebug(
+                    this@BondProbeService,
+                    "Dexcom connected",
+                    g.device?.address ?: "",
+                    null,
+                    event,
+                )
+                keepGattAfterGlucose(g)
+            }
+            .onFailure { error ->
+                Log.e(TAG, "Failed to parse glucose-like packet opcode=0x${opcode.toString(16).uppercase()} hex=${value.toHex()}", error)
+                DexcomConfigStore.saveScanDebug(
+                    this@BondProbeService,
+                    "Dexcom parse error",
+                    g.device?.address ?: "",
+                    null,
+                    "glucose parse error opcode=0x${opcode.toString(16).uppercase()} hex=${value.toHex()}",
+                )
+            }
+    
     }
 
     private fun keepGattAfterGlucose(gattToKeep: BluetoothGatt) {
@@ -2016,6 +2069,8 @@ class BondProbeService : Service() {
         resetWeakMatchCandidate()
         val closing = gatt
         gatt = null
+        g7Session?.close()
+        g7Session = null
         closing?.let {
             Log.i(TAG, "closeGatt ($reason)")
             if (!alreadyDisconnected) runCatching { it.disconnect() }
@@ -2055,8 +2110,11 @@ class BondProbeService : Service() {
             val filters = mutableListOf<ScanFilter>()
             val knownMac = config.knownMac
             val transmitterSuffix = config.transmitterId.takeLast(2)
-            val expectedDexcomName =
-                if (transmitterSuffix.length == 2) "$NAME_PREFIX$transmitterSuffix" else ""
+            val expectedDexcomName = when {
+                config.isG7 -> config.g7SensorName
+                transmitterSuffix.length == 2 -> "$NAME_PREFIX$transmitterSuffix"
+                else -> ""
+            }
             val broadScan = shouldUseBroadDexcomScan()
             if (expectedDexcomName.isNotBlank()) {
                 filters += ScanFilter.Builder()
@@ -2066,6 +2124,12 @@ class BondProbeService : Service() {
             if (knownMac.isNotBlank()) {
                 filters += ScanFilter.Builder()
                     .setDeviceAddress(knownMac)
+                    .build()
+            }
+            if (config.isG7 && filters.isEmpty()) {
+                // An unknown G7 is found by the service every Dexcom advertises; its name is learnt at pairing.
+                filters += ScanFilter.Builder()
+                    .setServiceUuid(DEXCOM_ADVERTISED_SERVICE)
                     .build()
             }
             currentScanBroad = broadScan || filters.isEmpty()
@@ -2155,15 +2219,24 @@ class BondProbeService : Service() {
             val rawNameOk = raw.contains("446578636F6D", ignoreCase = true)
             val dexcomServiceOk = uuids.contains("febc", ignoreCase = true) || raw.contains("BCFE", ignoreCase = true)
 
-            val nameOk = name?.startsWith(NAME_PREFIX, ignoreCase = true) == true || rawNameOk
+            val g7 = config.isG7
+            val nameOk = if (g7) {
+                G7Session.isG7Name(name) || raw.contains(G7_RAW_NAME_HEX, ignoreCase = true)
+            } else {
+                name?.startsWith(NAME_PREFIX, ignoreCase = true) == true || rawNameOk
+            }
             val macOk = knownMac.isNotEmpty() && addr.equals(knownMac, ignoreCase = true)
-            val txidOk = transmitterId.isNotBlank() &&
-                (
-                    name?.contains(transmitterId.takeLast(2), ignoreCase = true) == true ||
-                        raw.contains(transmitterId.takeLast(2).toByteArray(Charsets.UTF_8).toHex(), ignoreCase = true)
-                    )
+            val txidOk = if (g7) {
+                (config.g7SensorName.isBlank() || name.equals(config.g7SensorName, ignoreCase = true)) && !isG7Rejected(addr, now)
+            } else {
+                transmitterId.isNotBlank() &&
+                    (
+                        name?.contains(transmitterId.takeLast(2), ignoreCase = true) == true ||
+                            raw.contains(transmitterId.takeLast(2).toByteArray(Charsets.UTF_8).toHex(), ignoreCase = true)
+                        )
+            }
 
-            val wantTxid = transmitterId.isNotEmpty()
+            val wantTxid = g7 || transmitterId.isNotEmpty()
             val match = if (knownMac.isNotEmpty()) {
                 macOk || (nameOk && (!wantTxid || txidOk))
             } else {
@@ -2201,6 +2274,7 @@ class BondProbeService : Service() {
             }
 
             if (match) {
+                if (g7) g7MatchedName = name
 
                 val retryWait = gattRetryPolicy.remainingMs(SystemClock.elapsedRealtime())
                 if (retryWait > 0L) {
@@ -2363,6 +2437,95 @@ class BondProbeService : Service() {
             config.transmitterId.isNotBlank() ->
                 "Жду Dexcom ${config.transmitterId} / сенсор ${config.sensorCode.ifBlank { "не задан" }}"
             else -> "Укажите Dexcom трансмиттер в настройках"
+        }
+    }
+
+    private fun isG7Rejected(address: String, now: Long): Boolean = synchronized(g7RejectedUntilMillis) {
+        val until = g7RejectedUntilMillis[address.uppercase()] ?: return false
+        if (now >= until) {
+            g7RejectedUntilMillis.remove(address.uppercase())
+            return false
+        }
+        true
+    }
+
+    private fun startG7Session(g: BluetoothGatt) {
+        val device = g.device
+        // The key is kept under the sensor's address: the name a bonded device reports can change
+        // between the advertisement ("DXCMxx") and the connected device ("Dexcomxx").
+        val storedKey = device?.address?.let { DexcomConfigStore.loadG7SharedKey(this, it) }
+        val session = G7Session(
+            gatt = g,
+            pairingCode = config.g7PairingCode,
+            storedKey = storedKey,
+            worker = protocolWorker,
+            host = g7Host,
+        )
+        g7Session = session
+        session.start()
+    }
+
+    private val g7Host = object : G7Session.Host {
+        override fun journal(event: String, vararg values: Pair<String, Any?>) {
+            ConnectionJournal.record(this@BondProbeService, event, *values)
+        }
+
+        override fun status(text: String) {
+            updateNotif(text)
+            DexcomConfigStore.saveScanDebug(this@BondProbeService, gatt?.device?.name ?: "", gatt?.device?.address ?: "", null, text)
+        }
+
+        override fun onSharedKey(key: ByteArray) {
+            val address = gatt?.device?.address ?: return
+            DexcomConfigStore.saveG7SharedKey(this@BondProbeService, address, key)
+        }
+
+        override fun onKeyRejected(afterFreshPairing: Boolean) {
+            DexcomConfigStore.clearG7SharedKey(this@BondProbeService, if (afterFreshPairing) "code rejected" else "stale key")
+            val address = gatt?.device?.address ?: return
+            if (afterFreshPairing) {
+                synchronized(g7RejectedUntilMillis) { g7RejectedUntilMillis[address.uppercase()] = System.currentTimeMillis() + G7_REJECTED_ADDRESS_MS }
+                updateNotif("G7 ${gatt?.device?.name ?: address}: код сопряжения не подошёл")
+            }
+        }
+
+        override fun onAuthenticated(sensorName: String?) {
+            val device = gatt?.device
+            val name = g7MatchedName?.takeIf { G7Session.isG7Name(it) } ?: sensorName ?: device?.name
+            if (!name.isNullOrBlank()) DexcomConfigStore.saveG7SensorName(this@BondProbeService, name)
+            device?.address?.let { DexcomConfigStore.cacheDetectedMac(this@BondProbeService, it) }
+            config = DexcomConfigStore.load(this@BondProbeService)
+            sensorRequestSent = true
+            lastSensorRequestAtMillis = System.currentTimeMillis()
+        }
+
+        override fun onGlucose(packet: ByteArray) {
+            val g = gatt ?: return
+            val now = System.currentTimeMillis()
+            runCatching { SensorProtocol.reading(packet) }.getOrNull()?.let { reading ->
+                if (reading.timestamp > 0) SensorSessionStore.recordStartedAt(this@BondProbeService, now - reading.timestamp * 1000L, now)
+                ConnectionJournal.record(this@BondProbeService, "g7_glucose", "value" to reading.glucose, "state" to reading.state,
+                    "age_seconds" to reading.ageSeconds, "trend_tenths" to reading.trendTenths, "display_only" to reading.displayOnly,
+                    "info_byte" to (packet.getOrNull(18)?.toInt()?.and(0xFF)), "glucose_high_bits" to ((packet[13].toInt() and 0xF0) shr 4))
+            }
+            processSensorReading(g, packet)
+        }
+
+        override fun onBondRequired(device: BluetoothDevice) {
+            wakePairingScreen(device)
+            val created = runCatching {
+                device.javaClass.getMethod("createBond", Int::class.javaPrimitiveType).invoke(device, BluetoothDevice.TRANSPORT_LE) as Boolean
+            }.getOrElse { runCatching { device.createBond() }.getOrDefault(false) }
+            Log.i(TAG, "G7 createBond -> $created")
+            ConnectionJournal.record(this@BondProbeService, "g7_create_bond", "issued" to created)
+            if (!created) alertPairingNeeded(device)
+        }
+
+        override fun onFailure(reason: String) {
+            val failed = gatt ?: return
+            Log.w(TAG, "G7 session failed: $reason")
+            updateNotif("G7: $reason")
+            recoverAfterGattWriteFailure(failed, "g7 $reason")
         }
     }
 

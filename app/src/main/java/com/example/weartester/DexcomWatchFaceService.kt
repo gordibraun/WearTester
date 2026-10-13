@@ -86,7 +86,7 @@ class DexcomWatchFaceService : WatchFaceService() {
 
     private fun ensureCollectorService() {
         val config = DexcomConfigStore.load(applicationContext)
-        if (config.transmitterId.isBlank()) return
+        if (!config.isConfigured) return
         runCatching {
             ContextCompat.startForegroundService(
                 applicationContext,

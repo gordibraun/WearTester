@@ -22,5 +22,12 @@
     <string name="status_permissions_missing_short">Не хватает разрешений: %1$s</string>
     <string name="status_empty_value">не задан</string>
     <string name="status_summary">Трансмиттер: %1$s\nСенсор: %2$s</string>
+    <string name="status_summary_g7">Сенсор: Dexcom G7 %1$s\nКод сопряжения: %2$s</string>
+    <string name="button_sensor_model_g6">Датчик: G6 (нажмите для G7)</string>
+    <string name="button_sensor_model_g7">Датчик: G7 (нажмите для G6)</string>
+    <string name="hint_g7_pairing_code">Код сопряжения G7, 4 цифры</string>
+    <string name="button_edit_g7_pairing_code">Изменить код сопряжения</string>
+    <string name="dialog_title_g7_pairing_code">Код сопряжения G7 (с аппликатора)</string>
+    <string name="help_g7_setup">G7: введите 4-значный код сопряжения с аппликатора. Имя сенсора часы узнают сами при первом подключении.</string>
     <string name="status_scan_debug">Последний Dexcom scan:\nИмя: %1$s\nMAC: %2$s\nRSSI: %3$s\nСобытие: %4$s</string>
 </resources>

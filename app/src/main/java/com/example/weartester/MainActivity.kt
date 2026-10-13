@@ -28,9 +28,16 @@ class MainActivity : Activity() {
     private lateinit var titleView: TextView
     private lateinit var transmitterField: EditText
     private lateinit var sensorCodeField: EditText
+    private lateinit var g7PairingCodeField: EditText
+    private lateinit var sensorModelButton: Button
+    private lateinit var editG7PairingCodeButton: Button
+    private lateinit var editTransmitterButton: Button
+    private lateinit var editSensorButton: Button
     private lateinit var statusView: TextView
     private lateinit var transmitterInput: FieldInput
     private lateinit var sensorInput: FieldInput
+    private lateinit var g7PairingInput: FieldInput
+    private var sensorModel: SensorModel = SensorModel.G6
     private val uiHandler = Handler(Looper.getMainLooper())
     private val endPairingAttention = Runnable { clearPairingAttention() }
     private val refreshTicker = object : Runnable {
@@ -51,6 +58,11 @@ class MainActivity : Activity() {
         titleView = findViewById(R.id.titleView)
         transmitterField = findViewById(R.id.transmitterIdField)
         sensorCodeField = findViewById(R.id.sensorCodeField)
+        g7PairingCodeField = findViewById(R.id.g7PairingCodeField)
+        sensorModelButton = findViewById(R.id.sensorModelButton)
+        editG7PairingCodeButton = findViewById(R.id.editG7PairingCodeButton)
+        editTransmitterButton = findViewById(R.id.editTransmitterButton)
+        editSensorButton = findViewById(R.id.editSensorButton)
         statusView = findViewById(R.id.statusView)
         Log.d(TAG, "onCreate: view binding complete")
 
@@ -81,6 +93,15 @@ class MainActivity : Activity() {
 
         findViewById<Button>(R.id.editTransmitterButton).setOnClickListener {
             showEditDialog(transmitterInput)
+        }
+        editG7PairingCodeButton.setOnClickListener {
+            showEditDialog(g7PairingInput)
+        }
+        sensorModelButton.setOnClickListener {
+            sensorModel = if (sensorModel == SensorModel.G7) SensorModel.G6 else SensorModel.G7
+            saveConfig()
+            applySensorModel()
+            refreshStatus(getString(R.string.config_saved))
         }
         findViewById<Button>(R.id.editSensorButton).setOnClickListener {
             showEditDialog(sensorInput)
@@ -186,6 +207,23 @@ class MainActivity : Activity() {
         val config = DexcomConfigStore.load(this)
         transmitterField.setText(config.transmitterId)
         sensorCodeField.setText(config.sensorCode)
+        g7PairingCodeField.setText(config.g7PairingCode)
+        sensorModel = config.sensorModel
+        applySensorModel()
+    }
+
+    /** One model's fields at a time: the other's stay stored, out of the way. */
+    private fun applySensorModel() {
+        val g7 = sensorModel == SensorModel.G7
+        sensorModelButton.setText(if (g7) R.string.button_sensor_model_g7 else R.string.button_sensor_model_g6)
+        val g7Visibility = if (g7) android.view.View.VISIBLE else android.view.View.GONE
+        val g6Visibility = if (g7) android.view.View.GONE else android.view.View.VISIBLE
+        g7PairingCodeField.visibility = g7Visibility
+        editG7PairingCodeButton.visibility = g7Visibility
+        transmitterField.visibility = g6Visibility
+        editTransmitterButton.visibility = g6Visibility
+        sensorCodeField.visibility = g6Visibility
+        editSensorButton.visibility = g6Visibility
     }
 
     private fun showPowerCompatibility() {
@@ -263,8 +301,15 @@ class MainActivity : Activity() {
             maxLength = 4,
             digitsOnly = true,
         )
+        g7PairingInput = FieldInput(
+            field = g7PairingCodeField,
+            title = getString(R.string.dialog_title_g7_pairing_code),
+            maxLength = 4,
+            digitsOnly = true,
+        )
         configureEditableField(transmitterInput)
         configureEditableField(sensorInput)
+        configureEditableField(g7PairingInput)
         mainScrollView.requestFocus()
     }
 
@@ -337,16 +382,21 @@ class MainActivity : Activity() {
     private fun saveConfig() {
         val previous = DexcomConfigStore.load(this)
         val transmitterId = transmitterField.text?.toString().orEmpty()
+        val pairingCode = g7PairingCodeField.text?.toString().orEmpty().trim()
+        val sameSensor = if (sensorModel == SensorModel.G7) {
+            previous.sensorModel == SensorModel.G7 && previous.g7PairingCode == pairingCode
+        } else {
+            previous.sensorModel == SensorModel.G6 && previous.transmitterId.equals(transmitterId.trim(), ignoreCase = true)
+        }
         DexcomConfigStore.save(
             this,
             DexcomConfig(
                 transmitterId = transmitterId,
                 sensorCode = sensorCodeField.text?.toString().orEmpty(),
-                knownMac = if (previous.transmitterId.equals(transmitterId.trim(), ignoreCase = true)) {
-                    previous.knownMac
-                } else {
-                    ""
-                },
+                knownMac = if (sameSensor) previous.knownMac else "",
+                sensorModel = sensorModel,
+                g7PairingCode = pairingCode,
+                g7SensorName = if (sameSensor) previous.g7SensorName else "",
             ),
         )
     }
@@ -440,9 +490,14 @@ class MainActivity : Activity() {
                 missingPerms.joinToString(separator = ", "),
             )
         }
+        val summary = if (config.isG7) {
+            getString(R.string.status_summary_g7, config.g7SensorName.ifBlank { "(имя ещё не известно)" }, config.g7PairingCode.ifBlank { getString(R.string.status_empty_value) })
+        } else {
+            getString(R.string.status_summary, transmitter, sensorCode)
+        }
         val lines = listOfNotNull(
             prefix,
-            getString(R.string.status_summary, transmitter, sensorCode),
+            summary,
             getString(
                 R.string.status_scan_debug,
                 scanDebug.seenName.ifBlank { getString(R.string.status_empty_value) },

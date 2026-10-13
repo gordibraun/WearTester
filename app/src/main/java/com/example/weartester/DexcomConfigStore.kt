@@ -2,11 +2,28 @@ package com.example.weartester
 
 import android.content.Context
 
+enum class SensorModel { G6, G7 }
+
 data class DexcomConfig(
     val transmitterId: String,
     val sensorCode: String,
     val knownMac: String,
-)
+    val sensorModel: SensorModel = SensorModel.G6,
+    /** G7: the 4-digit pairing code printed on the applicator. */
+    val g7PairingCode: String = "",
+    /** G7: the sensor's Bluetooth name ("DXCMxx"), learnt at the first successful pairing. */
+    val g7SensorName: String = "",
+) {
+    val isG7: Boolean get() = sensorModel == SensorModel.G7
+
+    /** Enough is known to look for a sensor. */
+    val isConfigured: Boolean
+        get() = if (isG7) g7PairingCode.length == 4 else transmitterId.isNotBlank()
+
+    /** What the stored sensor session belongs to. */
+    val sensorIdentity: String
+        get() = if (isG7) g7SensorName.ifBlank { "G7:$g7PairingCode" } else transmitterId
+}
 
 data class ScanDebugState(
     val seenName: String,
@@ -32,6 +49,11 @@ object DexcomConfigStore {
     private const val KEY_TRANSMITTER_ID = "transmitter_id"
     private const val KEY_SENSOR_CODE = "sensor_code"
     private const val KEY_KNOWN_MAC = "known_mac"
+    private const val KEY_SENSOR_MODEL = "sensor_model"
+    private const val KEY_G7_PAIRING_CODE = "g7_pairing_code"
+    private const val KEY_G7_SENSOR_NAME = "g7_sensor_name"
+    private const val KEY_G7_SHARED_KEY = "g7_shared_key"
+    private const val KEY_G7_SHARED_KEY_SENSOR = "g7_shared_key_sensor"
     private const val KEY_LAST_SEEN_NAME = "last_seen_name"
     private const val KEY_LAST_SEEN_MAC = "last_seen_mac"
     private const val KEY_LAST_SEEN_RSSI = "last_seen_rssi"
@@ -70,6 +92,9 @@ object DexcomConfigStore {
                 ?.trim()
                 .orEmpty()
                 .uppercase(),
+            sensorModel = runCatching { SensorModel.valueOf(prefs.getString(KEY_SENSOR_MODEL, "") ?: "") }.getOrDefault(SensorModel.G6),
+            g7PairingCode = prefs.getString(KEY_G7_PAIRING_CODE, "")?.trim().orEmpty(),
+            g7SensorName = prefs.getString(KEY_G7_SENSOR_NAME, "")?.trim().orEmpty().uppercase(),
         )
     }
 
@@ -77,16 +102,30 @@ object DexcomConfigStore {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val previousTransmitter = prefs.getString(KEY_TRANSMITTER_ID, "")?.trim()?.uppercase().orEmpty()
         val previousSensor = prefs.getString(KEY_SENSOR_CODE, "")?.trim()?.uppercase().orEmpty()
+        val previousModel = prefs.getString(KEY_SENSOR_MODEL, SensorModel.G6.name).orEmpty()
+        val previousPairingCode = prefs.getString(KEY_G7_PAIRING_CODE, "")?.trim().orEmpty()
         val nextTransmitter = config.transmitterId.trim().uppercase()
         val nextSensor = config.sensorCode.trim().uppercase()
+        val nextPairingCode = config.g7PairingCode.trim()
+        val pairingChanged = previousModel != config.sensorModel.name || previousPairingCode != nextPairingCode
         val configChanged = prefs.contains(KEY_TRANSMITTER_ID) &&
-            (previousTransmitter != nextTransmitter || previousSensor != nextSensor)
+            (previousTransmitter != nextTransmitter || previousSensor != nextSensor || pairingChanged)
 
         prefs.edit()
             .putString(KEY_TRANSMITTER_ID, config.transmitterId.trim().uppercase())
             .putString(KEY_SENSOR_CODE, config.sensorCode.trim().uppercase())
             .putString(KEY_KNOWN_MAC, config.knownMac.trim().uppercase())
+            .putString(KEY_SENSOR_MODEL, config.sensorModel.name)
+            .putString(KEY_G7_PAIRING_CODE, nextPairingCode)
+            .putString(KEY_G7_SENSOR_NAME, config.g7SensorName.trim().uppercase())
             .apply {
+                if (pairingChanged) {
+                    // Another sensor, or another code for this one: the old pairing is not it.
+                    remove(KEY_G7_SHARED_KEY)
+                    remove(KEY_G7_SHARED_KEY_SENSOR)
+                    remove(KEY_G7_SENSOR_NAME)
+                    remove(KEY_KNOWN_MAC)
+                }
                 if (configChanged) {
                     remove(KEY_GLUCOSE_MGDL)
                     remove(KEY_GLUCOSE_RECEIVED_AT_MILLIS)
@@ -105,9 +144,44 @@ object DexcomConfigStore {
             appendEvent(
                 prefs,
                 System.currentTimeMillis(),
-                "config changed $previousTransmitter/$previousSensor -> $nextTransmitter/$nextSensor; cleared stale glucose",
+                "config changed $previousTransmitter/$previousSensor/${config.sensorModel} -> $nextTransmitter/$nextSensor/$nextPairingCode; cleared stale glucose",
             )
         }
+    }
+
+    /** G7: the sensor whose name the pairing learnt; the session and the key are kept under it. */
+    fun saveG7SensorName(context: Context, name: String) {
+        val normalized = name.trim().uppercase()
+        if (normalized.isBlank()) return
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        if (prefs.getString(KEY_G7_SENSOR_NAME, "") == normalized) return
+        prefs.edit().putString(KEY_G7_SENSOR_NAME, normalized).apply()
+        appendEvent(prefs, System.currentTimeMillis(), "G7 sensor $normalized")
+    }
+
+    /** G7: the AES key both sides derived at pairing; it authenticates every later connection. */
+    fun saveG7SharedKey(context: Context, sensor: String, key: ByteArray) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit()
+            .putString(KEY_G7_SHARED_KEY, key.joinToString("") { "%02X".format(it) })
+            .putString(KEY_G7_SHARED_KEY_SENSOR, sensor.trim().uppercase())
+            .apply()
+        appendEvent(prefs, System.currentTimeMillis(), "G7 paired with $sensor")
+    }
+
+    fun loadG7SharedKey(context: Context, sensor: String): ByteArray? {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        if (prefs.getString(KEY_G7_SHARED_KEY_SENSOR, "") != sensor.trim().uppercase()) return null
+        val hex = prefs.getString(KEY_G7_SHARED_KEY, "").orEmpty()
+        if (hex.length != 32) return null
+        return hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+    }
+
+    fun clearG7SharedKey(context: Context, reason: String) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        if (!prefs.contains(KEY_G7_SHARED_KEY)) return
+        prefs.edit().remove(KEY_G7_SHARED_KEY).remove(KEY_G7_SHARED_KEY_SENSOR).apply()
+        appendEvent(prefs, System.currentTimeMillis(), "G7 pairing forgotten: $reason")
     }
 
     fun cacheDetectedMac(context: Context, mac: String) {

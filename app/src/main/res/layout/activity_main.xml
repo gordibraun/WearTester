@@ -32,6 +32,38 @@
             android:text="@string/help_dexcom_setup"
             android:textColor="#D7DEE7" />
 
+        <Button
+            android:id="@+id/sensorModelButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="@string/button_sensor_model_g6" />
+
+        <EditText
+            android:id="@+id/g7PairingCodeField"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:clickable="true"
+            android:ems="4"
+            android:enabled="true"
+            android:focusable="true"
+            android:focusableInTouchMode="true"
+            android:hint="@string/hint_g7_pairing_code"
+            android:importantForAutofill="no"
+            android:inputType="number"
+            android:maxLength="4"
+            android:selectAllOnFocus="true"
+            android:singleLine="true"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/editG7PairingCodeButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/button_edit_g7_pairing_code"
+            android:visibility="gone" />
+
         <EditText
             android:id="@+id/transmitterIdField"
             android:layout_width="match_parent"

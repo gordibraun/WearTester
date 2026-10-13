@@ -3,9 +3,17 @@ package com.example.weartester
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-/** G6 control responses. Raw sensor current is not a calibrated glucose measurement. */
+/** G6 and G7 control responses. Raw sensor current is not a calibrated glucose measurement. */
 object SensorProtocol {
-    data class Reading(val timestamp: Int, val glucose: Int, val ageSeconds: Int, val state: Int, val displayOnly: Boolean) {
+    data class Reading(
+        val timestamp: Int,
+        val glucose: Int,
+        val ageSeconds: Int,
+        val state: Int,
+        val displayOnly: Boolean,
+        /** Rate of change in tenths of mg/dL per minute, when the packet carries one (0x4E only). */
+        val trendTenths: Int? = null,
+    ) {
         val usable: Boolean get() = state in setOf(6, 7) && glucose in 20..600 && !displayOnly && ageSeconds < 305
     }
     data class Session(val transmitterTime: Int, val startTime: Int) {
@@ -19,6 +27,11 @@ object SensorProtocol {
         return Session(data.getInt(2), data.getInt(6))
     }
 
+    /**
+     * 0x4E is the same 19-byte layout on the G6 (as its second glucose message) and on the G7 (as
+     * its only one): timestamp is seconds since the session started, age how long ago the sample
+     * was taken, so the sample's own time is timestamp - age.
+     */
     fun reading(packet: ByteArray): Reading {
         val opcode = packet.firstOrNull()?.toInt()?.and(255)
         val data = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
@@ -26,6 +39,7 @@ object SensorProtocol {
         val glucoseBits: Int
         val age: Int
         val state: Int
+        var trend: Int? = null
         when (opcode) {
             0x31, 0x4f -> {
                 require(packet.size >= (if (opcode == 0x4f) 18 else 16) && validCrc(packet)) { "Invalid glucose response" }
@@ -40,10 +54,11 @@ object SensorProtocol {
                 age = data.getShort(10).toInt() and 65535
                 glucoseBits = data.getShort(12).toInt() and 65535
                 state = packet[14].toInt() and 255
+                trend = packet[15].toInt().takeIf { it != 0x7f }
             }
             else -> error("Not a calibrated glucose response")
         }
-        return Reading(timestamp, glucoseBits and 4095, age, state, glucoseBits and 0xf000 != 0)
+        return Reading(timestamp, glucoseBits and 4095, age, state, glucoseBits and 0xf000 != 0, trend)
     }
 
     fun validCrc(packet: ByteArray): Boolean {

@@ -18,11 +18,13 @@ object GlucoseSyncBridge {
     const val KEY_AGE_SECONDS = "ageSeconds"
     const val KEY_SOURCE = "source"
     const val KEY_TRANSMITTER_ID = "transmitterId"
+    const val KEY_SENSOR_MODEL = "sensorModel"
 
     fun sendWatchGlucose(
         context: Context,
         reading: GlucoseReadingState,
         transmitterId: String,
+        sensorModel: String = "G6",
     ) {
         val mgdl = reading.mgdl
         if (mgdl == null || mgdl !in MIN_GLUCOSE_MGDL..MAX_GLUCOSE_MGDL) {
@@ -41,6 +43,7 @@ object GlucoseSyncBridge {
             dataMap.putInt(KEY_AGE_SECONDS, reading.ageSeconds)
             dataMap.putString(KEY_SOURCE, source)
             dataMap.putString(KEY_TRANSMITTER_ID, transmitterId)
+            dataMap.putString(KEY_SENSOR_MODEL, sensorModel)
             dataMap.putLong("sentAt", System.currentTimeMillis())
         }.asPutDataRequest().setUrgent()
 
@@ -60,6 +63,7 @@ object GlucoseSyncBridge {
             .put(KEY_SOURCE, source)
             .put("sentAt", System.currentTimeMillis())
             .put(KEY_TRANSMITTER_ID, transmitterId)
+            .put(KEY_SENSOR_MODEL, sensorModel)
             .toString()
             .toByteArray(Charsets.UTF_8)
 

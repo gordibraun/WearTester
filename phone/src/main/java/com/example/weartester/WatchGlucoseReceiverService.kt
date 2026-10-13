@@ -27,6 +27,7 @@ class WatchGlucoseReceiverService : WearableListenerService() {
                     dexTimestamp = map.getInt(GlucoseSyncBridge.KEY_DEX_TIMESTAMP, 0),
                     ageSeconds = map.getInt(GlucoseSyncBridge.KEY_AGE_SECONDS, 0),
                     transport = "data-item",
+                    sensorModel = map.getString(GlucoseSyncBridge.KEY_SENSOR_MODEL, "G6"),
                 )
             }
         }
@@ -54,6 +55,7 @@ class WatchGlucoseReceiverService : WearableListenerService() {
                 dexTimestamp = json.optInt(GlucoseSyncBridge.KEY_DEX_TIMESTAMP, 0),
                 ageSeconds = json.optInt(GlucoseSyncBridge.KEY_AGE_SECONDS, 0),
                 transport = "message",
+                sensorModel = json.optString(GlucoseSyncBridge.KEY_SENSOR_MODEL, "G6"),
             )
         }.onFailure {
             Log.w(TAG, "Failed to parse watch glucose message", it)

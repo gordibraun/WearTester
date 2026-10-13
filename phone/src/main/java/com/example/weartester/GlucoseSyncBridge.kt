@@ -24,6 +24,7 @@ object GlucoseSyncBridge {
     const val KEY_AGE_SECONDS = "ageSeconds"
     const val KEY_SOURCE = "source"
     const val KEY_TRANSMITTER_ID = "transmitterId"
+    const val KEY_SENSOR_MODEL = "sensorModel"
 
     private const val XDRIP_PACKAGE = "com.eveningoutpost.dexdrip"
     private const val ACTION_NIGHTSCOUT_NEW_SGV = "info.nightscout.client.NEW_SGV"
@@ -54,6 +55,7 @@ object GlucoseSyncBridge {
     private const val XDRIP_EXTRA_SOURCE_DESC = "com.eveningoutpost.dexdrip.Extras.SourceDesc"
     /** What AAPS calls a G6 read natively through xDrip; the same word keeps its handling of the value unchanged. */
     private const val SOURCE_INFO_G6_NATIVE = "G6 Native"
+    private const val SOURCE_INFO_G7_NATIVE = "G7 Native"
     private const val SOURCE_DESC_WATCH = "WearTester watch bridge"
     private const val KEY_LAST_SENT_TO_AAPS_AT = "last_sent_to_aaps_at"
 
@@ -66,6 +68,7 @@ object GlucoseSyncBridge {
         dexTimestamp: Int,
         ageSeconds: Int,
         transport: String,
+        sensorModel: String = "G6",
     ) {
         if (mgdl !in MIN_GLUCOSE_MGDL..MAX_GLUCOSE_MGDL) {
             Log.w(TAG, "Ignoring implausible watch glucose: $mgdl")
@@ -102,7 +105,7 @@ object GlucoseSyncBridge {
             dexTimestamp = dexTimestamp,
             ageSeconds = ageSeconds,
         )
-        forwardToAaps(context, mgdl, sampleAt, previousMgdl.takeIf { it > 0 }, previousAt)
+        forwardToAaps(context, mgdl, sampleAt, previousMgdl.takeIf { it > 0 }, previousAt, sensorModel)
         prefs.edit()
             .putInt(KEY_LAST_FORWARDED_MGDL, mgdl)
             .putLong(KEY_LAST_FORWARDED_TIMESTAMP, sampleAt)
@@ -113,13 +116,13 @@ object GlucoseSyncBridge {
     }
 
     /** The reading to AAPS directly, in the form of xDrip's own broadcast, addressed to AAPS alone. */
-    private fun forwardToAaps(context: Context, mgdl: Int, timestamp: Long, previousMgdl: Int?, previousAt: Long) {
+    private fun forwardToAaps(context: Context, mgdl: Int, timestamp: Long, previousMgdl: Int?, previousAt: Long, sensorModel: String) {
         val intent = Intent(ACTION_XDRIP_BG_ESTIMATE)
             .setPackage(AAPS_PACKAGE)
             .putExtra(XDRIP_EXTRA_BG_ESTIMATE, mgdl.toDouble())
             .putExtra(XDRIP_EXTRA_RAW, mgdl.toDouble())
             .putExtra(XDRIP_EXTRA_TIME, timestamp)
-            .putExtra(XDRIP_EXTRA_SOURCE_INFO, SOURCE_INFO_G6_NATIVE)
+            .putExtra(XDRIP_EXTRA_SOURCE_INFO, if (sensorModel == "G7") SOURCE_INFO_G7_NATIVE else SOURCE_INFO_G6_NATIVE)
             .putExtra(XDRIP_EXTRA_SOURCE_DESC, SOURCE_DESC_WATCH)
             .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
         // The trend from the previous forwarded reading, in Dexcom's words, when it is recent enough to mean anything.

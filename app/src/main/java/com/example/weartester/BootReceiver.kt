@@ -9,7 +9,7 @@ class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
             val config = DexcomConfigStore.load(context)
-            if (config.transmitterId.isBlank()) return
+            if (!config.isConfigured) return
             ContextCompat.startForegroundService(
                 context,
                 Intent(context, BondProbeService::class.java)

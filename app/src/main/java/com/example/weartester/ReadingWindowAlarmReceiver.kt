@@ -9,7 +9,7 @@ class ReadingWindowAlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != BondProbeService.ACTION_READING_WINDOW_WAKE) return
         val config = DexcomConfigStore.load(context)
-        if (config.transmitterId.isBlank()) return
+        if (!config.isConfigured) return
         ContextCompat.startForegroundService(
             context,
             Intent(context, BondProbeService::class.java)
