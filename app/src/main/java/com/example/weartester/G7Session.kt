@@ -88,6 +88,8 @@ internal class G7Session(
     @Volatile private var inbound = ByteArray(0)
     @Volatile private var expectedInbound = 0
     @Volatile private var bondRequested = false
+    /** The system reported a bond in progress or done for this link. */
+    @Volatile private var bondSeen = false
     @Volatile private var writeLatch: CountDownLatch? = null
     @Volatile private var closed = false
 
@@ -164,6 +166,7 @@ internal class G7Session(
     fun onBondStateChanged(state: Int) {
         if (closed) return
         host.journal("g7_bond_state", "state" to state, "phase" to phase.name)
+        if (state == BluetoothDevice.BOND_BONDING || state == BluetoothDevice.BOND_BONDED) bondSeen = true
         when (state) {
             BluetoothDevice.BOND_BONDING -> host.status("G7: подтвердите сопряжение на часах")
             BluetoothDevice.BOND_BONDED -> {
@@ -202,8 +205,16 @@ internal class G7Session(
             // sensor or the stack opens the pairing and the system handles it as an incoming one.
             worker.execute {
                 write(auth!!, byteArrayOf(0x07), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-                Thread.sleep(600)
-                if (!closed && !locallyBonded()) dataPhase()
+                // The sensor starts the pairing itself within a second of the request (13 Oct,
+                // 13:55). Opening the control characteristic at the same time made the stack start a
+                // second one and the watch asked twice; so wait, and only fall back to that if the
+                // sensor does nothing.
+                val waitUntil = System.currentTimeMillis() + BOND_START_WAIT_MS
+                while (!closed && !bondSeen && System.currentTimeMillis() < waitUntil) Thread.sleep(200)
+                if (!closed && !bondSeen && !locallyBonded()) {
+                    host.journal("g7_bond_fallback")
+                    dataPhase()
+                }
             }
             return
         }
@@ -493,6 +504,7 @@ internal class G7Session(
         private const val TAG = "G7Session"
         private const val CHUNK = 20
         private const val WRITE_ACK_TIMEOUT_MS = 700L
+        private const val BOND_START_WAIT_MS = 6_000L
 
         /** GATT statuses meaning "pair first": insufficient authentication, authorization, encryption. */
         private val SECURITY_STATUSES = setOf(5, 8, 15, 137)
