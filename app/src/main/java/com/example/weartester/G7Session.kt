@@ -85,8 +85,8 @@ internal class G7Session(
     private var key: ByteArray? = storedKey
     private var freshKey = false
     private var token = ByteArray(8)
-    private var inbound = ByteArray(0)
-    private var expectedInbound = 0
+    @Volatile private var inbound = ByteArray(0)
+    @Volatile private var expectedInbound = 0
     @Volatile private var bondRequested = false
     @Volatile private var writeLatch: CountDownLatch? = null
     @Volatile private var closed = false
@@ -277,7 +277,8 @@ internal class G7Session(
             fail("implausible sensor certificate size $size")
             return
         }
-        expect(size)
+        // Certificate bytes may already be arriving: keep them, only set what to wait for.
+        expectedInbound = size
         if (inbound.size >= size) onInboundComplete()
     }
 
