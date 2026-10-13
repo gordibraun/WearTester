@@ -110,6 +110,17 @@ internal class G7Session(
         if (closed) return
         val ch = descriptor.characteristic
         if (status != BluetoothGatt.GATT_SUCCESS) {
+            if (ch.uuid == CONTROL && status in SECURITY_STATUSES) {
+                // The link must be encrypted first. The stack starts the pairing itself on this
+                // refusal (the consent dialog appears on the watch); the bond receiver brings us back.
+                host.journal("g7_control_needs_bond", "status" to status)
+                host.status("G7: подтвердите сопряжение на часах")
+                if (!bondRequested) {
+                    bondRequested = true
+                    host.onBondRequired(gatt.device)
+                }
+                return
+            }
             fail("descriptor write failed status=$status uuid=${ch.uuid}")
             return
         }
@@ -157,7 +168,8 @@ internal class G7Session(
             BluetoothDevice.BOND_BONDING -> host.status("G7: подтвердите сопряжение на часах")
             BluetoothDevice.BOND_BONDED -> {
                 bondRequested = false
-                if (phase != Phase.GET_DATA || !dataRequested) dataPhase()
+                dataRequested = false
+                dataPhase()
             }
             BluetoothDevice.BOND_NONE -> if (bondRequested) {
                 bondRequested = false
@@ -181,8 +193,19 @@ internal class G7Session(
         host.journal("g7_auth_rx", "phase" to phase.name, "hex" to value.toHex())
         if (!locallyBonded() && !bondRequested && BOND_TRIGGERS.any { it.contentEquals(value) }) {
             bondRequested = true
+            host.journal("g7_bond_wanted", "hex" to value.toHex())
             host.status("G7: сенсор просит сопряжение")
             host.onBondRequired(gatt.device)
+            // Not createBond(): on this watch it dereferences a null native hook for a peripheral
+            // with a random-type address and takes the Bluetooth stack down (13 Oct, twice). The
+            // G6 way instead: the bond request opcode, then a protected characteristic, so that the
+            // sensor or the stack opens the pairing and the system handles it as an incoming one.
+            worker.execute {
+                write(auth!!, byteArrayOf(0x07), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                Thread.sleep(600)
+                if (!closed && !locallyBonded()) dataPhase()
+            }
+            return
         }
         when (phase) {
             Phase.REQUEST_AUTH -> onChallenge(value)
@@ -196,6 +219,8 @@ internal class G7Session(
             }
             Phase.GET_DATA -> if (value.contentEquals(byteArrayOf(0x06, 0x01)) || locallyBonded()) {
                 if (!dataRequested) dataPhase()
+            } else {
+                host.journal("g7_auth_rx_unbonded", "hex" to value.toHex())
             }
             else -> Log.i(TAG, "auth bytes in $phase ignored")
         }
@@ -468,6 +493,9 @@ internal class G7Session(
         private const val TAG = "G7Session"
         private const val CHUNK = 20
         private const val WRITE_ACK_TIMEOUT_MS = 700L
+
+        /** GATT statuses meaning "pair first": insufficient authentication, authorization, encryption. */
+        private val SECURITY_STATUSES = setOf(5, 8, 15, 137)
         val CGM_SERVICE: UUID = UUID.fromString("f8083532-849e-531c-c594-30f1f86a4ea5")
         val CONTROL: UUID = UUID.fromString("f8083534-849e-531c-c594-30f1f86a4ea5")
         val AUTHENTICATION: UUID = UUID.fromString("f8083535-849e-531c-c594-30f1f86a4ea5")

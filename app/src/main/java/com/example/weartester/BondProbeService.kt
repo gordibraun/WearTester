@@ -144,6 +144,10 @@ class BondProbeService : Service() {
         /** A G7 that rejected our pairing code is someone else's, or the code is wrong: leave it alone for a while. */
         private const val G7_REJECTED_ADDRESS_MS = 10 * 60_000L
         private const val G7_RAW_NAME_HEX = "4458434D"
+        /** How long after the due time the watch waits before saying the sensor did not come. */
+        private const val EXPECTED_CONTACT_GRACE_MS = 90_000L
+        private const val MISSED_CONTACT_ALERT_REPEAT_MS = 10 * 60_000L
+        private const val MISSED_CONTACT_NOTIF_ID = 44
         private val DEXCOM_ADVERTISED_SERVICE: ParcelUuid = ParcelUuid.fromString("0000febc-0000-1000-8000-00805f9b34fb")
         private const val DEXCOM_TIMESTAMP_RESET_ACCEPT_SECONDS = 60 * 60
         private const val POST_GLUCOSE_DUPLICATE_SUPPRESSION_MS = 2 * 60_000L
@@ -191,6 +195,9 @@ class BondProbeService : Service() {
     @Volatile private var g7MatchedName: String? = null
     private val g7RejectedUntilMillis = HashMap<String, Long>()
     private var g7RejectionsForCode = ""
+    /** When the next sensor contact is due; an alert goes out if it does not come. */
+    @Volatile private var expectedContactByMillis = 0L
+    @Volatile private var lastMissedContactAlertAtMillis = 0L
     @Volatile private var bondFlowStarted = false
     @Volatile private var sensorRequestSent = false
     @Volatile private var reconnectDelayMs = RECONNECT_DELAY_MS
@@ -978,6 +985,9 @@ class BondProbeService : Service() {
                     sleep(reconnectDelayMs)
                     continue
                 }
+                if (expectedContactByMillis <= 0L) {
+                    expectContact(maxOf(lastSensorContactAtMillis, System.currentTimeMillis() - 60_000L), "scan start")
+                }
                 var scanDeadline = System.currentTimeMillis() + SCAN_MS
                 while (wantConnected) {
                     val loopNow = System.currentTimeMillis()
@@ -1124,6 +1134,7 @@ class BondProbeService : Service() {
             runCatching { ConnectionMonitor.tick(this) }
                 .onFailure { Log.w(TAG, "Connection diagnostic unavailable", it) }
             requestComplicationRefresh("watchdog age tick")
+            checkExpectedContact()
             lastSensorContactAtMillis = maxOf(
                 lastSensorContactAtMillis,
                 DexcomConfigStore.loadDirectGlucose(this).receivedAtMillis,
@@ -1931,6 +1942,8 @@ class BondProbeService : Service() {
                     )
                 }
                 lastSensorContactAtMillis = System.currentTimeMillis()
+                getSystemService(NotificationManager::class.java)?.cancel(MISSED_CONTACT_NOTIF_ID)
+                expectContact(lastSensorContactAtMillis, "glucose")
                 earlyGattFailureCount = 0
                 consecutiveSilentBroadScanRestarts = 0
                 sensorRequestSent = false
@@ -2442,6 +2455,54 @@ class BondProbeService : Service() {
         }
     }
 
+    /** The sensor is expected five minutes after its last contact; without any, six minutes after the search began. */
+    private fun expectContact(from: Long, reason: String) {
+        val due = from + DEXCOM_READING_PERIOD_MS + EXPECTED_CONTACT_GRACE_MS
+        if (due == expectedContactByMillis) return
+        expectedContactByMillis = due
+        ConnectionJournal.record(this, "contact_expected", "by" to due, "reason" to reason)
+    }
+
+    private fun checkExpectedContact() {
+        val due = expectedContactByMillis
+        if (due <= 0L) return
+        val now = System.currentTimeMillis()
+        if (now < due) return
+        if (lastSensorContactAtMillis >= due - DEXCOM_READING_PERIOD_MS - EXPECTED_CONTACT_GRACE_MS) {
+            // Contact came after the expectation was set: nothing missed.
+            expectedContactByMillis = 0L
+            return
+        }
+        if (now - lastMissedContactAlertAtMillis < MISSED_CONTACT_ALERT_REPEAT_MS) return
+        lastMissedContactAlertAtMillis = now
+        val dueText = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(due))
+        val lastText = lastSensorContactAtMillis.takeIf { it > 0L }
+            ?.let { java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(it)) } ?: "ещё не было"
+        val text = "Сенсор не вышел на связь к $dueText (последний контакт $lastText)"
+        ConnectionJournal.record(this, "contact_missed", "by" to due, "last_contact" to lastSensorContactAtMillis)
+        vibrateAlert()
+        val contentIntent = PendingIntent.getActivity(
+            this, 1044,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        getSystemService(NotificationManager::class.java)?.notify(
+            MISSED_CONTACT_NOTIF_ID,
+            NotificationCompat.Builder(this, ALERT_CH_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                .setContentTitle("Нет связи с сенсором")
+                .setContentText(text)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                .setPriority(NotificationCompat.PRIORITY_MAX)
+                .setCategory(NotificationCompat.CATEGORY_ALARM)
+                .setContentIntent(contentIntent)
+                .setAutoCancel(true)
+                .build(),
+        )
+        // Ask again one period later, not every 30 s.
+        expectedContactByMillis = now + DEXCOM_READING_PERIOD_MS
+    }
+
     private fun isG7Rejected(address: String, now: Long): Boolean = synchronized(g7RejectedUntilMillis) {
         val until = g7RejectedUntilMillis[address.uppercase()] ?: return false
         if (now >= until) {
@@ -2464,6 +2525,7 @@ class BondProbeService : Service() {
             host = g7Host,
         )
         g7Session = session
+        expectContact(System.currentTimeMillis(), "g7 session")
         session.start()
     }
 
@@ -2514,13 +2576,12 @@ class BondProbeService : Service() {
         }
 
         override fun onBondRequired(device: BluetoothDevice) {
+            // No createBond() here: for a random-address peripheral it crashes this watch's
+            // Bluetooth process (13 Oct, twice). The session makes the sensor or the stack open
+            // the pairing; the watch only has to be awake and loud for the consent dialog.
             wakePairingScreen(device)
-            // The public call only. The hidden createBond(transport) with TRANSPORT_LE crashes this
-            // watch's Bluetooth process (null native hook, 13 Oct 2026); the G6 bonds the same way.
-            val created = runCatching { device.createBond() }.getOrDefault(false)
-            Log.i(TAG, "G7 createBond -> $created")
-            ConnectionJournal.record(this@BondProbeService, "g7_create_bond", "issued" to created)
-            if (!created) alertPairingNeeded(device)
+            alertPairingNeeded(device)
+            ConnectionJournal.record(this@BondProbeService, "g7_bond_awaited")
         }
 
         override fun onFailure(reason: String) {
