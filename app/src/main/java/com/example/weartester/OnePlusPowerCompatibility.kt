@@ -14,15 +14,20 @@ internal object OnePlusPowerCompatibility {
     private const val OWNED_BOOT = "owned_boot"
     private const val STATUS = "status"
     private const val CHECK_INTERVAL_MS = 5 * 60_000L
-    private const val TESTED_FINGERPRINT =
-        "OnePlus/OPWWE251/OPWWE251:14/AW2A.240903.001.A3.OPWWE251_11_A.162.260526/01:user/release-keys"
+    /**
+     * The OnePlus Watch 3 on Wear OS 5: the same vendor app manager (dumpsys app.manager) is in
+     * every patch level seen so far (A.162 of May 2026, A.165 of September 2026, which the watch
+     * updated to on 13 Oct 2026 and which left this switched off for three days), so the build is
+     * matched up to the patch number.
+     */
+    private const val TESTED_FINGERPRINT_PREFIX = "OnePlus/OPWWE251/OPWWE251:14/AW2A.240903.001.A3.OPWWE251_11_A."
     private val worker = Executors.newSingleThreadExecutor { task -> Thread(task, "OnePlusPower") }
     @Volatile private var collectorRunning = false
     private var nextCheckAt = 0L
     private var queued = false
     private var forcePending = false
 
-    fun isSupported() = Build.FINGERPRINT == TESTED_FINGERPRINT
+    fun isSupported() = Build.FINGERPRINT.startsWith(TESTED_FINGERPRINT_PREFIX)
     fun isEnabled(context: Context) = prefs(context).getBoolean(ENABLED, false)
     fun hasPermission(context: Context) =
         context.checkSelfPermission("android.permission.DUMP") == PackageManager.PERMISSION_GRANTED

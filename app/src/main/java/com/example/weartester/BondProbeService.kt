@@ -148,6 +148,10 @@ class BondProbeService : Service() {
         private const val EXPECTED_CONTACT_GRACE_MS = 90_000L
         private const val MISSED_CONTACT_ALERT_REPEAT_MS = 10 * 60_000L
         private const val MISSED_CONTACT_NOTIF_ID = 44
+        private const val HIBERNATION_NOTIF_ID = 45
+        private const val HIBERNATION_ALERT_REPEAT_MS = 12 * 60 * 60_000L
+        /** OnePlus Watch 3 "Автоматическая гибернация": Settings.System, 1 (the default when unset) means on. */
+        private const val ONEPLUS_AUTO_HIBERNATION_KEY = "device_deep_sleep"
         private val DEXCOM_ADVERTISED_SERVICE: ParcelUuid = ParcelUuid.fromString("0000febc-0000-1000-8000-00805f9b34fb")
         private const val DEXCOM_TIMESTAMP_RESET_ACCEPT_SECONDS = 60 * 60
         private const val POST_GLUCOSE_DUPLICATE_SUPPRESSION_MS = 2 * 60_000L
@@ -198,6 +202,7 @@ class BondProbeService : Service() {
     /** When the next sensor contact is due; an alert goes out if it does not come. */
     @Volatile private var expectedContactByMillis = 0L
     @Volatile private var lastMissedContactAlertAtMillis = 0L
+    @Volatile private var lastHibernationAlertAtMillis = 0L
     @Volatile private var bondFlowStarted = false
     @Volatile private var sensorRequestSent = false
     @Volatile private var reconnectDelayMs = RECONNECT_DELAY_MS
@@ -1135,6 +1140,7 @@ class BondProbeService : Service() {
                 .onFailure { Log.w(TAG, "Connection diagnostic unavailable", it) }
             requestComplicationRefresh("watchdog age tick")
             checkExpectedContact()
+            keepAutoHibernationOff()
             lastSensorContactAtMillis = maxOf(
                 lastSensorContactAtMillis,
                 DexcomConfigStore.loadDirectGlucose(this).receivedAtMillis,
@@ -2453,6 +2459,42 @@ class BondProbeService : Service() {
                 "Жду Dexcom ${config.transmitterId} / сенсор ${config.sensorCode.ifBlank { "не задан" }}"
             else -> "Укажите Dexcom трансмиттер в настройках"
         }
+    }
+
+    /**
+     * The OnePlus Watch 3 shuts Android down into "hibernation" between 23:00 and 5:30 by default
+     * whenever it is tracking sleep or lies still off the wrist for half an hour; with Android off
+     * the sensor is not read (the nights of 15 and 16 Oct 2026: 23:42-05:11 and 00:12-00:27 lost).
+     * The Battery settings switch writes this system setting; here it is kept off, or, without
+     * the right to write it, the owner is told to switch it off.
+     */
+    private fun keepAutoHibernationOff() {
+        val enabled = runCatching { Settings.System.getInt(contentResolver, ONEPLUS_AUTO_HIBERNATION_KEY, 1) }.getOrDefault(1) == 1
+        if (!enabled) return
+        val now = System.currentTimeMillis()
+        if (Settings.System.canWrite(this)) {
+            val written = runCatching { Settings.System.putInt(contentResolver, ONEPLUS_AUTO_HIBERNATION_KEY, 0) }.getOrDefault(false)
+            ConnectionJournal.record(this, "auto_hibernation_switched_off", "written" to written)
+            if (written) {
+                DexcomConfigStore.saveScanDebug(this, "", config.knownMac, null, "автогибернация OnePlus выключена сборщиком")
+                return
+            }
+        }
+        if (now - lastHibernationAlertAtMillis < HIBERNATION_ALERT_REPEAT_MS) return
+        lastHibernationAlertAtMillis = now
+        ConnectionJournal.record(this, "auto_hibernation_enabled")
+        val text = "На часах включена автоматическая гибернация: ночью Android выключается и сенсор не читается. Настройки → Батарея → Автоматическая гибернация → выключить."
+        getSystemService(NotificationManager::class.java)?.notify(
+            HIBERNATION_NOTIF_ID,
+            NotificationCompat.Builder(this, ALERT_CH_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_warning)
+                .setContentTitle("Выключите автогибернацию")
+                .setContentText(text)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setAutoCancel(true)
+                .build(),
+        )
     }
 
     /** The sensor is expected five minutes after its last contact; without any, six minutes after the search began. */
