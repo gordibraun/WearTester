@@ -349,7 +349,27 @@ class MainActivity : Activity() {
             .setTitle(inputConfig.title)
             .setView(input)
             .setPositiveButton(android.R.string.ok) { _, _ ->
-                inputConfig.field.setText(input.text?.toString().orEmpty())
+                val entered = input.text?.toString().orEmpty().trim()
+                val current = DexcomConfigStore.load(this)
+                // A paired G7 is lost with its code: the key and the sensor's name go with it, and
+                // the sensor rejects every connection until the right code is back (18 Oct 2026, an
+                // hour without glucose after a slip of the finger). So a change asks first.
+                val breaksPairing = inputConfig === g7PairingInput && current.isG7 &&
+                    entered != current.g7PairingCode && current.g7SensorName.isNotBlank()
+                if (breaksPairing) {
+                    AlertDialog.Builder(this)
+                        .setTitle(getString(R.string.dialog_title_g7_code_change))
+                        .setMessage(getString(R.string.dialog_message_g7_code_change, current.g7SensorName, current.g7PairingCode, entered))
+                        .setPositiveButton(R.string.button_g7_code_change_confirm) { _, _ ->
+                            inputConfig.field.setText(entered)
+                            saveConfig()
+                            refreshStatus(getString(R.string.config_saved))
+                        }
+                        .setNegativeButton(android.R.string.cancel) { _, _ -> refreshStatus(getString(R.string.g7_code_kept)) }
+                        .show()
+                    return@setPositiveButton
+                }
+                inputConfig.field.setText(entered)
                 saveConfig()
                 refreshStatus(getString(R.string.config_saved))
             }

@@ -28,6 +28,10 @@
     <string name="hint_g7_pairing_code">Код сопряжения G7, 4 цифры</string>
     <string name="button_edit_g7_pairing_code">Изменить код сопряжения</string>
     <string name="dialog_title_g7_pairing_code">Код сопряжения G7 (с аппликатора)</string>
+    <string name="dialog_title_g7_code_change">Сменить код сопряжения?</string>
+    <string name="dialog_message_g7_code_change">Часы связаны с сенсором %1$s по коду %2$s. Новый код %3$s сбросит эту связь: ключ и имя сенсора будут забыты, и пока код не совпадёт с кодом на аппликаторе, сенсор не будет отдавать глюкозу. Менять код нужно только при установке нового сенсора.</string>
+    <string name="button_g7_code_change_confirm">Да, это новый сенсор</string>
+    <string name="g7_code_kept">Код сопряжения оставлен прежним</string>
     <string name="help_g7_setup">G7: введите 4-значный код сопряжения с аппликатора. Имя сенсора часы узнают сами при первом подключении.</string>
     <string name="status_scan_debug">Последний Dexcom scan:\nИмя: %1$s\nMAC: %2$s\nRSSI: %3$s\nСобытие: %4$s</string>
 </resources>

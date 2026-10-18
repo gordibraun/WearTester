@@ -2258,11 +2258,15 @@ class BondProbeService : Service() {
             }
 
             val wantTxid = g7 || transmitterId.isNotEmpty()
-            val match = if (knownMac.isNotEmpty()) {
+            val matchByAddressOrName = if (knownMac.isNotEmpty()) {
                 macOk || (nameOk && (!wantTxid || txidOk))
             } else {
                 nameOk && (!wantTxid || txidOk)
             }
+            // A G7 that has just rejected our pairing code is left alone for a while whichever way it
+            // was recognised; matching it by its remembered address made the watch try it every
+            // minute (18 Oct 2026, an hour of rejections with a mistyped code).
+            val match = matchByAddressOrName && !(g7 && isG7Rejected(addr, now))
 
             if (match || nameOk || dexcomServiceOk) {
                 lastDexcomAdvertisementAtMillis = now
