@@ -2621,6 +2621,12 @@ class BondProbeService : Service() {
             processSensorReading(g, packet)
         }
 
+        override fun onStaleBond(device: BluetoothDevice) {
+            Log.w(TAG, "G7 bond no longer recognised by the sensor; removing it")
+            DexcomConfigStore.saveScanDebug(this@BondProbeService, device.name ?: "", device.address ?: "", null, "G7: сенсор не знает связь часов; связь сброшена, будет новое сопряжение")
+            removeBond(device)
+        }
+
         override fun onBondRequired(device: BluetoothDevice) {
             // No createBond() here: for a random-address peripheral it crashes this watch's
             // Bluetooth process (13 Oct, twice). The session makes the sensor or the stack open

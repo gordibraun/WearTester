@@ -54,6 +54,8 @@ internal class G7Session(
         fun onKeyRejected(afterFreshPairing: Boolean)
         /** The sensor has accepted us; it is about to be asked for glucose. */
         fun onAuthenticated(sensorName: String?)
+        /** The sensor no longer recognises the watch's Bluetooth bond: drop it so the next session can bond afresh. */
+        fun onStaleBond(device: BluetoothDevice)
         /** A 0x4E control packet. */
         fun onGlucose(packet: ByteArray)
         /** The sensor wants a Bluetooth bond; create it and get the user to confirm. */
@@ -228,10 +230,15 @@ internal class G7Session(
                 host.journal("g7_identity_accepted")
                 writeAuth(byteArrayOf(0x06, 0x19))
             }
-            Phase.GET_DATA -> if (value.contentEquals(byteArrayOf(0x06, 0x01)) || locallyBonded()) {
-                if (!dataRequested) dataPhase()
-            } else {
-                host.journal("g7_auth_rx_unbonded", "hex" to value.toHex())
+            Phase.GET_DATA -> when {
+                value.contentEquals(byteArrayOf(0x06, 0x00)) && locallyBonded() && !bondRequested -> {
+                    // The watch holds a bond the sensor does not: it will refuse data on this link.
+                    host.journal("g7_bond_stale")
+                    host.onStaleBond(gatt.device)
+                    fail("the sensor does not recognise the watch's bond; it is dropped for a fresh one")
+                }
+                value.contentEquals(byteArrayOf(0x06, 0x01)) || locallyBonded() -> if (!dataRequested) dataPhase()
+                else -> host.journal("g7_auth_rx_unbonded", "hex" to value.toHex())
             }
             else -> Log.i(TAG, "auth bytes in $phase ignored")
         }
@@ -286,7 +293,11 @@ internal class G7Session(
                 host.onKeyRejected(false)
                 fail("sensor does not accept the stored key (auth=$authenticated)")
             }
-            (authenticated == 1 && bonded == 1) || (locallyBonded() && bonded == 2) -> dataPhase()
+            // A key made in this very session is provisional to the sensor until the display has
+            // shown its certificate and signed the sensor's challenge: asked for glucose straight
+            // after a re-pairing with the bond still in place, the sensor dropped the link and
+            // forgot the key (18 Oct 2026, 15:19). So a fresh key always goes through that step.
+            !freshKey && ((authenticated == 1 && bonded == 1) || (locallyBonded() && bonded == 2)) -> dataPhase()
             else -> askCertificate(0)
         }
     }
