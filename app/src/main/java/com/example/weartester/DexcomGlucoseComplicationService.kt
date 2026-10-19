@@ -71,10 +71,11 @@ class DexcomGlucoseComplicationService : ComplicationDataSourceService() {
         } else {
             "Ожидаю данные Dexcom"
         }
+        // Through the triple-tap gate: a single tap on the glucose must not open the setup.
         val openApp = PendingIntent.getActivity(
             this,
             1,
-            Intent(this, MainActivity::class.java)
+            Intent(this, TripleTapGateActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
                 .putExtra(MainActivity.EXTRA_OPEN_TIMER_FOCUS, true)
                 .putExtra(MainActivity.EXTRA_AUTO_START_PROBE, true),

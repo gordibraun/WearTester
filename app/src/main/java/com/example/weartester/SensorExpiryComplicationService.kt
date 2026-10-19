@@ -37,7 +37,7 @@ class SensorExpiryComplicationService : ComplicationDataSourceService() {
 
     private fun data(session: SensorLifetime, now: Long): ComplicationData {
         val label = session.label(now)
-        val open = PendingIntent.getActivity(this, 24, Intent(this, MainActivity::class.java)
+        val open = PendingIntent.getActivity(this, 24, Intent(this, TripleTapGateActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return LongTextComplicationData.Builder(PlainComplicationText.Builder(label.text).build(), PlainComplicationText.Builder(label.text).build())
             .setTitle(PlainComplicationText.Builder(if (label.urgent) "!" else "").build())

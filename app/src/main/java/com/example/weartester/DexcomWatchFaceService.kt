@@ -68,7 +68,8 @@ class DexcomWatchFaceService : WatchFaceService() {
                     Log.i(TAG, "Tap event type=$tapType x=${tapEvent.xPos} y=${tapEvent.yPos}")
                     if (!tapEvent.isInsideGlucoseShortcut()) return
                     ensureCollectorService()
-                    val intent = Intent(applicationContext, MainActivity::class.java)
+                    // Through the triple-tap gate: a single tap on the glucose must not open the setup.
+                    val intent = Intent(applicationContext, TripleTapGateActivity::class.java)
                         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
                         .putExtra(MainActivity.EXTRA_OPEN_TIMER_FOCUS, true)
                         .putExtra(MainActivity.EXTRA_AUTO_START_PROBE, true)

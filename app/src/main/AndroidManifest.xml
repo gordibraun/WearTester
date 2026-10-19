@@ -59,6 +59,14 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- Counts taps on the glucose (face and complications): the third within a second opens MainActivity. -->
+        <activity
+            android:name=".TripleTapGateActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <!-- Наш тестовый сервис бондинга -->
         <service
