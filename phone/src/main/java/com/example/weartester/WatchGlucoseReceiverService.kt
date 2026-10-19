@@ -38,6 +38,11 @@ class WatchGlucoseReceiverService : WearableListenerService() {
             runCatching {
                 val ping = JSONObject(String(messageEvent.data, Charsets.UTF_8))
                 acknowledge(messageEvent.sourceNodeId, ping.optLong("sentAt", 0), 0, "heartbeat")
+                WatchHealthAlert.onHeartbeat(
+                    applicationContext,
+                    sensorAgeMs = if (ping.isNull("sensorAgeMs")) null else ping.optLong("sensorAgeMs"),
+                    btWedged = ping.optBoolean("btWedged", false),
+                )
             }.onFailure { ConnectionJournal.record(this, "invalid_ping") }
             return
         }

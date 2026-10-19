@@ -9,7 +9,8 @@ import org.json.JSONObject
 object ConnectionMonitor {
     const val PING = "/weartester/diagnostic/ping"
     const val ACK = "/weartester/diagnostic/ack"
-    private const val PREFS = "connection_monitor"
+    const val PREFS = "connection_monitor"
+    const val KEY_BT_WEDGED = "bt_wedged"
     private var previousTick = 0L
 
     fun tick(context: Context) {
@@ -30,7 +31,11 @@ object ConnectionMonitor {
                 "sensor_contact_at" to SensorSessionStore.load(context).lastContactAt, "sensor_state" to SensorSessionStore.load(context).state,
                 "watchdog_interval_ms" to delay, "interactive" to pm?.isInteractive, "idle" to pm?.isDeviceIdleMode,
                 "power_save" to pm?.isPowerSaveMode, "battery_exempt" to pm?.isIgnoringBatteryOptimizations(context.packageName))
-            val ping = JSONObject().put("sentAt", now).put("elapsed", elapsed).toString().toByteArray()
+            // The phone gets the sensor's age and the wedge flag with every heartbeat, so that it can
+            // raise the owner when the watch, out of sight on a charger, cannot.
+            val ping = JSONObject().put("sentAt", now).put("elapsed", elapsed)
+                .put("sensorAgeMs", age ?: JSONObject.NULL).put("btWedged", prefs.getBoolean(KEY_BT_WEDGED, false))
+                .toString().toByteArray()
             nodes.forEach { node -> Wearable.getMessageClient(context).sendMessage(node.id, PING, ping)
                 .addOnFailureListener { ConnectionJournal.record(context, "ping_failed", "error" to it.javaClass.simpleName) } }
         }.addOnFailureListener { ConnectionJournal.record(context, "nodes_failed", "error" to it.javaClass.simpleName) }

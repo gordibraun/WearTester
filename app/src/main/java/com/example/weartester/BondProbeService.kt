@@ -149,6 +149,17 @@ class BondProbeService : Service() {
         private const val MISSED_CONTACT_ALERT_REPEAT_MS = 10 * 60_000L
         private const val MISSED_CONTACT_NOTIF_ID = 44
         private const val HIBERNATION_NOTIF_ID = 45
+        private const val BT_WEDGE_NOTIF_ID = 46
+        /**
+         * Connect attempts that hang before CONNECTED, one after another, while the sensor keeps
+         * advertising: the watch's Bluetooth stack has wedged (19 Oct 2026: 308 such hangs in three
+         * hours, at any signal strength, cured only by switching Bluetooth off and on).
+         */
+        private const val BT_WEDGE_TIMEOUTS = 8
+        private const val BT_WEDGE_ALERT_REPEAT_MS = 10 * 60_000L
+        private const val BT_WEDGE_LONG_AUTOCONNECT_MS = 3 * 60_000L
+        /** Incident dumps for the same hang, over and over, cost more than they tell; keep the first few. */
+        private const val BT_WEDGE_INCIDENTS_KEPT = 3
         private const val HIBERNATION_ALERT_REPEAT_MS = 12 * 60 * 60_000L
         /** OnePlus Watch 3 "Автоматическая гибернация": Settings.System, 1 (the default when unset) means on. */
         private const val ONEPLUS_AUTO_HIBERNATION_KEY = "device_deep_sleep"
@@ -203,6 +214,10 @@ class BondProbeService : Service() {
     @Volatile private var expectedContactByMillis = 0L
     @Volatile private var lastMissedContactAlertAtMillis = 0L
     @Volatile private var lastHibernationAlertAtMillis = 0L
+    /** CONNECTING-phase timeouts since the last connection that got through. */
+    @Volatile private var consecutiveConnectingTimeouts = 0
+    @Volatile private var lastBtWedgeAlertAtMillis = 0L
+    @Volatile private var btWedgeLongProbeTried = false
     @Volatile private var bondFlowStarted = false
     @Volatile private var sensorRequestSent = false
     @Volatile private var reconnectDelayMs = RECONNECT_DELAY_MS
@@ -1330,11 +1345,15 @@ class BondProbeService : Service() {
 
         // Recheck and close under the callback lock: a just-established link must
         // never be cancelled using the shorter CONNECTING deadline.
+        if (phase == GattTimeoutPolicy.Phase.CONNECTING) consecutiveConnectingTimeouts += 1
         ConnectionJournal.record(this, "gatt_phase_timeout", "phase" to phase.name,
             "attempt_ms" to attemptAge, "connected_ms" to connectedAge,
-            "rssi" to currentGattMatchRssi.takeUnless { it == Int.MIN_VALUE })
-        BluetoothIncidentRecorder.capture(this, "gatt_timeout", "phase" to phase.name,
-            "attempt_ms" to attemptAge, "connected_ms" to connectedAge)
+            "rssi" to currentGattMatchRssi.takeUnless { it == Int.MIN_VALUE }, "consecutive" to consecutiveConnectingTimeouts)
+        if (consecutiveConnectingTimeouts <= BT_WEDGE_INCIDENTS_KEPT) {
+            BluetoothIncidentRecorder.capture(this, "gatt_timeout", "phase" to phase.name,
+                "attempt_ms" to attemptAge, "connected_ms" to connectedAge)
+        }
+        if (consecutiveConnectingTimeouts >= BT_WEDGE_TIMEOUTS) onBluetoothWedged()
         val reason = "gatt ${phase.name} timeout ${attemptAge}ms"
         DexcomConfigStore.saveScanDebug(this, "", config.knownMac, null, reason)
         val device = attempt.device
@@ -1607,6 +1626,13 @@ class BondProbeService : Service() {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     gattRetryPolicy.connected()
+                    if (consecutiveConnectingTimeouts >= BT_WEDGE_TIMEOUTS) {
+                        ConnectionJournal.record(this@BondProbeService, "bt_wedge_cleared", "timeouts" to consecutiveConnectingTimeouts)
+                        getSystemService(NotificationManager::class.java)?.cancel(BT_WEDGE_NOTIF_ID)
+                    }
+                    consecutiveConnectingTimeouts = 0
+                    btWedgeLongProbeTried = false
+                    noteBluetoothWedge(false)
                     gattConnectStartedAtMillis = System.currentTimeMillis()
                     gattConnectedAtMillis = gattConnectStartedAtMillis
                     gattConnectedAtElapsed = SystemClock.elapsedRealtime()
@@ -2466,6 +2492,59 @@ class BondProbeService : Service() {
     }
 
     /**
+     * Eight hung connects in a row with the sensor advertising all along: the Bluetooth stack has
+     * wedged. An app may not switch Bluetooth off and on (Android 13+ refuses non-system apps), so
+     * one long background connect is tried, and then the owner is told, loudly and with the
+     * Bluetooth settings one tap away, on the watch and through the phone.
+     */
+    private fun onBluetoothWedged() {
+        noteBluetoothWedge(true)
+        val now = System.currentTimeMillis()
+        if (!btWedgeLongProbeTried) {
+            btWedgeLongProbeTried = true
+            ConnectionJournal.record(this, "bt_wedge_detected", "timeouts" to consecutiveConnectingTimeouts)
+            // Not under the direct-connect rules: the stack's own background connect, for minutes.
+            protocolWorker.execute {
+                sleep(500)
+                val tried = maybeTryBondedDirectRecovery(
+                    reason = "bt wedge long autoconnect", allowDuringBroadScan = true, minRetryMs = 0L,
+                    preferAutoConnect = true, connectTimeoutMs = BT_WEDGE_LONG_AUTOCONNECT_MS,
+                )
+                ConnectionJournal.record(this, "bt_wedge_long_autoconnect", "started" to tried)
+            }
+        }
+        if (now - lastBtWedgeAlertAtMillis < BT_WEDGE_ALERT_REPEAT_MS) return
+        lastBtWedgeAlertAtMillis = now
+        vibrateAlert()
+        val text = "Сенсор виден, но $consecutiveConnectingTimeouts подключений подряд зависли: Bluetooth часов завис. Выключите и включите Bluetooth на часах (Настройки → Подключения)."
+        val open = PendingIntent.getActivity(
+            this, 1046,
+            Intent(Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        getSystemService(NotificationManager::class.java)?.notify(
+            BT_WEDGE_NOTIF_ID,
+            NotificationCompat.Builder(this, ALERT_CH_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                .setContentTitle("Bluetooth часов завис")
+                .setContentText(text)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                .setPriority(NotificationCompat.PRIORITY_MAX)
+                .setCategory(NotificationCompat.CATEGORY_ALARM)
+                .setContentIntent(open)
+                .setAutoCancel(true)
+                .build(),
+        )
+        DexcomConfigStore.saveScanDebug(this, "", config.knownMac, null, "bluetooth завис: $consecutiveConnectingTimeouts подключений подряд не прошли")
+    }
+
+    /** What the phone is told with every heartbeat; see [ConnectionMonitor]. */
+    private fun noteBluetoothWedge(wedged: Boolean) {
+        getSharedPreferences(ConnectionMonitor.PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(ConnectionMonitor.KEY_BT_WEDGED, wedged).apply()
+    }
+
+    /**
      * The OnePlus Watch 3 shuts Android down into "hibernation" between 23:00 and 5:30 by default
      * whenever it is tracking sleep or lies still off the wrist for half an hour; with Android off
      * the sensor is not read (the nights of 15 and 16 Oct 2026: 23:42-05:11 and 00:12-00:27 lost).
@@ -2524,7 +2603,9 @@ class BondProbeService : Service() {
         val dueText = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(due))
         val lastText = lastSensorContactAtMillis.takeIf { it > 0L }
             ?.let { java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(it)) } ?: "ещё не было"
-        val text = "Сенсор не вышел на связь к $dueText (последний контакт $lastText)"
+        val wedged = consecutiveConnectingTimeouts >= BT_WEDGE_TIMEOUTS
+        val text = "Сенсор не вышел на связь к $dueText (последний контакт $lastText)" +
+            if (wedged) ". Сенсор виден, подключения зависают: выключите и включите Bluetooth на часах" else ""
         ConnectionJournal.record(this, "contact_missed", "by" to due, "last_contact" to lastSensorContactAtMillis)
         vibrateAlert()
         val contentIntent = PendingIntent.getActivity(

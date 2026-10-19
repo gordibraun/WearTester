@@ -79,6 +79,7 @@ object GlucoseSyncBridge {
             Log.w(TAG, "Ignoring watch glucose with invalid timestamp: $timestamp")
             return
         }
+        WatchHealthAlert.clear(context)
         val sampleAt = normalizeSampleTimestamp(readingAt, ageSeconds)
 
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
