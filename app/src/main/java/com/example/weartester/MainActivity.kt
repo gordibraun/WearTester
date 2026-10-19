@@ -91,19 +91,21 @@ class MainActivity : Activity() {
 
         configureWearInput()
 
-        findViewById<Button>(R.id.editTransmitterButton).setOnClickListener {
+        // Everything that changes the sensor setup opens only on three quick taps: a single stray
+        // tap next to the glucose readout used to open an editor or flip the model (see TripleTap).
+        TripleTap.attach(findViewById<Button>(R.id.editTransmitterButton), EDIT_HINT) {
             showEditDialog(transmitterInput)
         }
-        editG7PairingCodeButton.setOnClickListener {
+        TripleTap.attach(editG7PairingCodeButton, EDIT_HINT) {
             showEditDialog(g7PairingInput)
         }
-        sensorModelButton.setOnClickListener {
+        TripleTap.attach(sensorModelButton, "Сменить датчик: 3 быстрых нажатия") {
             sensorModel = if (sensorModel == SensorModel.G7) SensorModel.G6 else SensorModel.G7
             saveConfig()
             applySensorModel()
             refreshStatus(getString(R.string.config_saved))
         }
-        findViewById<Button>(R.id.editSensorButton).setOnClickListener {
+        TripleTap.attach(findViewById<Button>(R.id.editSensorButton), EDIT_HINT) {
             showEditDialog(sensorInput)
         }
         findViewById<Button>(R.id.startButton).setOnClickListener {
@@ -319,13 +321,8 @@ class MainActivity : Activity() {
         field.isClickable = true
         field.isFocusable = true
         field.isFocusableInTouchMode = true
-        field.setOnTouchListener { _, event ->
-            if (event.action == MotionEvent.ACTION_UP) {
-                showEditDialog(inputConfig)
-            }
-            true
-        }
-        field.setOnClickListener {
+        // A tap on the field itself used to open the editor at once; now three quick taps do.
+        TripleTap.attach(field, EDIT_HINT) {
             showEditDialog(inputConfig)
         }
     }
@@ -583,6 +580,7 @@ class MainActivity : Activity() {
         const val EXTRA_FORCE_PAIRING_ATTENTION = "force_pairing_attention"
         const val EXTRA_OPEN_TIMER_FOCUS = "open_timer_focus"
         private const val TAG = "WearTesterMain"
+        private const val EDIT_HINT = "Изменить: 3 быстрых нажатия"
         private const val DEXCOM_WINDOW_SECONDS = 5L * 60L
         private const val ROTARY_SCROLL_PIXELS = 140
     }
