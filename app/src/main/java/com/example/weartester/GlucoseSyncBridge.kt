@@ -19,6 +19,8 @@ object GlucoseSyncBridge {
     const val KEY_SOURCE = "source"
     const val KEY_TRANSMITTER_ID = "transmitterId"
     const val KEY_SENSOR_MODEL = "sensorModel"
+    /** Dexcom's own rate of change, tenths of mg/dL per minute; absent when the packet carried none. */
+    const val KEY_TREND_TENTHS = "trendTenths"
 
     fun sendWatchGlucose(
         context: Context,
@@ -44,6 +46,7 @@ object GlucoseSyncBridge {
             dataMap.putString(KEY_SOURCE, source)
             dataMap.putString(KEY_TRANSMITTER_ID, transmitterId)
             dataMap.putString(KEY_SENSOR_MODEL, sensorModel)
+            reading.trendTenths?.let { dataMap.putInt(KEY_TREND_TENTHS, it) }
             dataMap.putLong("sentAt", System.currentTimeMillis())
         }.asPutDataRequest().setUrgent()
 
@@ -64,6 +67,7 @@ object GlucoseSyncBridge {
             .put("sentAt", System.currentTimeMillis())
             .put(KEY_TRANSMITTER_ID, transmitterId)
             .put(KEY_SENSOR_MODEL, sensorModel)
+            .put(KEY_TREND_TENTHS, reading.trendTenths ?: JSONObject.NULL)
             .toString()
             .toByteArray(Charsets.UTF_8)
 

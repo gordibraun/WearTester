@@ -42,6 +42,8 @@ data class GlucoseReadingState(
     val source: String,
     /** The transmitter showed this value but did not vouch for it; shown on the face, handed to nobody. */
     val displayOnly: Boolean = false,
+    /** Dexcom's own rate of change in tenths of mg/dL per minute, when the packet carried one. */
+    val trendTenths: Int? = null,
 )
 
 object DexcomConfigStore {
@@ -66,11 +68,16 @@ object DexcomConfigStore {
     private const val KEY_GLUCOSE_AGE_SECONDS = "glucose_age_seconds"
     private const val KEY_GLUCOSE_SOURCE = "glucose_source"
     private const val KEY_GLUCOSE_DISPLAY_ONLY = "glucose_display_only"
+    private const val KEY_GLUCOSE_TREND_TENTHS = "glucose_trend_tenths"
     private const val KEY_DIRECT_GLUCOSE_MGDL = "direct_glucose_mgdl"
     private const val KEY_DIRECT_GLUCOSE_RECEIVED_AT_MILLIS = "direct_glucose_received_at_millis"
     private const val KEY_DIRECT_GLUCOSE_DEX_TIMESTAMP = "direct_glucose_dex_timestamp"
     private const val KEY_DIRECT_GLUCOSE_AGE_SECONDS = "direct_glucose_age_seconds"
     private const val KEY_DIRECT_GLUCOSE_SOURCE = "direct_glucose_source"
+    private const val KEY_DIRECT_GLUCOSE_TREND_TENTHS = "direct_glucose_trend_tenths"
+
+    /** Stored in place of a trend the packet did not carry. */
+    private const val NO_TREND = Int.MIN_VALUE
     private const val KEY_EVENT_LOG = "event_log"
     private const val EVENT_LOG_MAX_LINES = 90
     private const val EVENT_LOG_MAX_EVENT_CHARS = 220
@@ -254,6 +261,7 @@ object DexcomConfigStore {
             ageSeconds = prefs.getInt(KEY_GLUCOSE_AGE_SECONDS, 0),
             source = prefs.getString(KEY_GLUCOSE_SOURCE, "") ?: "",
             displayOnly = prefs.getBoolean(KEY_GLUCOSE_DISPLAY_ONLY, false),
+            trendTenths = prefs.getInt(KEY_GLUCOSE_TREND_TENTHS, NO_TREND).takeIf { it != NO_TREND },
         )
     }
 
@@ -290,6 +298,7 @@ object DexcomConfigStore {
             dexTimestamp = prefs.getInt(KEY_DIRECT_GLUCOSE_DEX_TIMESTAMP, 0),
             ageSeconds = prefs.getInt(KEY_DIRECT_GLUCOSE_AGE_SECONDS, 0),
             source = prefs.getString(KEY_DIRECT_GLUCOSE_SOURCE, "") ?: "",
+            trendTenths = prefs.getInt(KEY_DIRECT_GLUCOSE_TREND_TENTHS, NO_TREND).takeIf { it != NO_TREND },
         )
     }
 
@@ -328,6 +337,7 @@ object DexcomConfigStore {
         dexTimestamp: Int,
         ageSeconds: Int,
         source: String,
+        trendTenths: Int? = null,
     ): GlucoseReadingState {
         return saveDirectGlucose(
             context = context,
@@ -335,6 +345,7 @@ object DexcomConfigStore {
             dexTimestamp = dexTimestamp,
             ageSeconds = ageSeconds,
             source = source,
+            trendTenths = trendTenths,
         )
     }
 
@@ -344,6 +355,7 @@ object DexcomConfigStore {
         dexTimestamp: Int,
         ageSeconds: Int,
         source: String,
+        trendTenths: Int? = null,
     ): GlucoseReadingState {
         require(mgdl in 20..600) { "Sensor status code is not glucose" }
         val receivedAtMillis = System.currentTimeMillis()
@@ -357,8 +369,9 @@ object DexcomConfigStore {
             .putInt(KEY_DIRECT_GLUCOSE_DEX_TIMESTAMP, dexTimestamp)
             .putInt(KEY_DIRECT_GLUCOSE_AGE_SECONDS, ageSeconds)
             .putString(KEY_DIRECT_GLUCOSE_SOURCE, source)
+            .putInt(KEY_DIRECT_GLUCOSE_TREND_TENTHS, trendTenths ?: NO_TREND)
             .apply()
-        appendEvent(prefs, receivedAtMillis, "direct glucose ${mgdl} mg/dL source=$source dexTs=$dexTimestamp age=${ageSeconds}s")
+        appendEvent(prefs, receivedAtMillis, "direct glucose ${mgdl} mg/dL source=$source dexTs=$dexTimestamp age=${ageSeconds}s trend=${trendTenths ?: "-"}")
         saveGlucoseAt(
             context = context,
             mgdl = mgdl,
@@ -366,8 +379,9 @@ object DexcomConfigStore {
             dexTimestamp = dexTimestamp,
             ageSeconds = ageSeconds,
             source = source,
+            trendTenths = trendTenths,
         )
-        return GlucoseReadingState(mgdl, receivedAtMillis, dexTimestamp, ageSeconds, source)
+        return GlucoseReadingState(mgdl, receivedAtMillis, dexTimestamp, ageSeconds, source, trendTenths = trendTenths)
     }
 
     fun saveGlucoseIfNewer(
@@ -404,6 +418,7 @@ object DexcomConfigStore {
         dexTimestamp: Int,
         ageSeconds: Int,
         source: String,
+        trendTenths: Int? = null,
     ) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
@@ -413,6 +428,7 @@ object DexcomConfigStore {
             .putInt(KEY_GLUCOSE_AGE_SECONDS, ageSeconds)
             .putString(KEY_GLUCOSE_SOURCE, source)
             .putBoolean(KEY_GLUCOSE_DISPLAY_ONLY, false)
+            .putInt(KEY_GLUCOSE_TREND_TENTHS, trendTenths ?: NO_TREND)
             .apply()
     }
 

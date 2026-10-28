@@ -1991,6 +1991,7 @@ class BondProbeService : Service() {
                     sensor.timestamp,
                     sensor.ageSeconds,
                     "opcode=0x${opcode.toString(16).uppercase()}",
+                    trendTenths = sensor.trendTenths,
                 )
                 GlucoseSyncBridge.sendWatchGlucose(
                     context = this@BondProbeService,
