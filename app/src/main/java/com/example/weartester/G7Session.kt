@@ -58,6 +58,8 @@ internal class G7Session(
         fun onStaleBond(device: BluetoothDevice)
         /** A 0x4E control packet. */
         fun onGlucose(packet: ByteArray)
+        /** A 0x35 control packet: the sensor's verdict on a calibration sent this connection. */
+        fun onCalibrationResult(packet: ByteArray)
         /** The sensor wants a Bluetooth bond; create it and get the user to confirm. */
         fun onBondRequired(device: BluetoothDevice)
         /** The handshake cannot continue; the host disconnects. */
@@ -189,6 +191,21 @@ internal class G7Session(
         dataRequested = true
         host.status("G7: запрашиваю глюкозу")
         worker.execute { write(control, byteArrayOf(0x4E), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) }
+    }
+
+    /**
+     * Hands the sensor a fingerstick (see [CalibrationPolicy.message]) on the connection that just
+     * delivered glucose; the sensor answers with 0x35 on the same characteristic.
+     */
+    fun sendCalibration(bytes: ByteArray): Boolean {
+        val control = control ?: return false
+        if (closed || phase != Phase.GET_DATA) return false
+        host.journal("g7_calibration_write", "hex" to bytes.toHex())
+        worker.execute {
+            val ok = write(control, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+            if (!ok) host.journal("g7_calibration_write_failed")
+        }
+        return true
     }
 
     // ---- authentication characteristic -------------------------------------------------------
@@ -431,6 +448,7 @@ internal class G7Session(
         if (value.isEmpty()) return
         when (value[0].toInt() and 0xFF) {
             0x4E -> host.onGlucose(value)
+            0x35 -> host.onCalibrationResult(value)
             0x59 -> host.journal("g7_backfill_end")
             else -> host.journal("g7_control_rx", "hex" to value.toHex())
         }

@@ -63,11 +63,17 @@ object SensorProtocol {
 
     fun validCrc(packet: ByteArray): Boolean {
         if (packet.size < 3) return false
+        val crc = crc16(packet.copyOfRange(0, packet.size - 2))
+        return crc == ((packet[packet.lastIndex - 1].toInt() and 255) or ((packet.last().toInt() and 255) shl 8))
+    }
+
+    /** CRC-16/XMODEM (poly 0x1021, init 0), the checksum on every Dexcom control message. */
+    fun crc16(bytes: ByteArray): Int {
         var crc = 0
-        for (byte in packet.dropLast(2)) {
+        for (byte in bytes) {
             crc = crc xor ((byte.toInt() and 255) shl 8)
             repeat(8) { crc = (if (crc and 0x8000 != 0) (crc shl 1) xor 0x1021 else crc shl 1) and 65535 }
         }
-        return crc == ((packet[packet.lastIndex - 1].toInt() and 255) or ((packet.last().toInt() and 255) shl 8))
+        return crc
     }
 }

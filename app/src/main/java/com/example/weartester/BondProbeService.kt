@@ -2640,6 +2640,40 @@ class BondProbeService : Service() {
         true
     }
 
+    /**
+     * Hands the queued fingerstick to the sensor while the connection that just gave glucose is
+     * still open. Too old a fingerstick is dropped rather than sent: the sensor would place it
+     * at the wrong moment of its curve.
+     */
+    private fun sendPendingCalibration(now: Long) {
+        val request = CalibrationStore.pending(this) ?: return
+        val session = g7Session ?: return
+        if (now - request.atEpochMs > CalibrationPolicy.MAX_AGE_MS) {
+            CalibrationStore.take(this)
+            CalibrationStore.recordDropped(this, request, "не отправлена: прокол старше часа, сенсор не было видно", now)
+            updateNotif("Калибровка не отправлена: прокол старше часа")
+            vibrateAlert()
+            return
+        }
+        val startedAt = SensorSessionStore.load(this).startedAt
+        val dexTime = CalibrationPolicy.dexTimeSeconds(request.atEpochMs, startedAt)
+        if (dexTime == null) {
+            CalibrationStore.take(this)
+            CalibrationStore.recordDropped(this, request, "не отправлена: часы не знают время сенсора", now)
+            updateNotif("Калибровка не отправлена: нет времени сенсора")
+            return
+        }
+        val bytes = CalibrationPolicy.message(request.mgdl, dexTime)
+        if (session.sendCalibration(bytes)) {
+            CalibrationStore.take(this)
+            CalibrationStore.recordSent(this, request, now)
+            Log.i(TAG, "G7 calibration sent: ${request.mgdl} mg/dL at sensor second $dexTime")
+            updateNotif("Калибровка ${request.mgdl} отправлена, жду ответ сенсора")
+        } else {
+            ConnectionJournal.record(this, "calibration_not_sent", "why" to "session not in data phase")
+        }
+    }
+
     private fun startG7Session(g: BluetoothGatt) {
         val device = g.device
         // The key is kept under the sensor's address: the name a bonded device reports can change
@@ -2700,7 +2734,20 @@ class BondProbeService : Service() {
                     "age_seconds" to reading.ageSeconds, "trend_tenths" to reading.trendTenths, "display_only" to reading.displayOnly,
                     "info_byte" to (packet.getOrNull(18)?.toInt()?.and(0xFF)), "glucose_high_bits" to ((packet[13].toInt() and 0xF0) shr 4))
             }
+            // A fingerstick the owner queued goes out on this same connection, right behind the
+            // glucose packet, as xDrip does it; the sensor's verdict comes back as 0x35.
+            sendPendingCalibration(now)
             processSensorReading(g, packet)
+        }
+
+        override fun onCalibrationResult(packet: ByteArray) {
+            val result = CalibrationPolicy.parseReply(packet) ?: return
+            val now = System.currentTimeMillis()
+            CalibrationStore.recordResult(this@BondProbeService, result, now)
+            Log.i(TAG, "G7 calibration reply: ${result.text} (code ${result.code})")
+            updateNotif("Калибровка: ${result.text}")
+            vibrateAlert()
+            requestComplicationRefresh("calibration result", force = true)
         }
 
         override fun onStaleBond(device: BluetoothDevice) {

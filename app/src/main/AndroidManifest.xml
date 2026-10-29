@@ -60,6 +60,12 @@
             </intent-filter>
         </activity>
         <!-- Counts taps on the glucose (face and complications): the third within a second opens MainActivity. -->
+        <!-- Exported only to the shell (DUMP permission), so adb can open the screen for checks. -->
+        <activity
+            android:name=".CalibrationActivity"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:label="Калибровка" />
         <activity
             android:name=".TripleTapGateActivity"
             android:exported="true"

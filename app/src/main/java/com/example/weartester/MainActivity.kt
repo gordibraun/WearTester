@@ -33,6 +33,7 @@ class MainActivity : Activity() {
     private lateinit var editG7PairingCodeButton: Button
     private lateinit var editTransmitterButton: Button
     private lateinit var editSensorButton: Button
+    private lateinit var calibrationButton: Button
     private lateinit var statusView: TextView
     private lateinit var transmitterInput: FieldInput
     private lateinit var sensorInput: FieldInput
@@ -76,6 +77,11 @@ class MainActivity : Activity() {
             }
         }
         rootContainer.addView(controls, 1)
+        calibrationButton = Button(this).apply {
+            text = "Калибровка G7"; isAllCaps = false
+            setOnClickListener { startActivity(Intent(this@MainActivity, CalibrationActivity::class.java)) }
+        }
+        rootContainer.addView(calibrationButton, 2)
         rootContainer.addView(Button(this).apply {
             text = "Связь"; isAllCaps = false
             setOnClickListener {
@@ -226,6 +232,7 @@ class MainActivity : Activity() {
         editTransmitterButton.visibility = g6Visibility
         sensorCodeField.visibility = g6Visibility
         editSensorButton.visibility = g6Visibility
+        if (::calibrationButton.isInitialized) calibrationButton.visibility = g7Visibility
     }
 
     private fun showPowerCompatibility() {
