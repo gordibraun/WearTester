@@ -2001,6 +2001,8 @@ class BondProbeService : Service() {
                 )
                 requestComplicationRefresh("glucose packet", force = true)
                 updateNotif("Глюкоза ${sensor.glucose} mg/dL")
+                // The low-glucose alarm (30.10.2026): a confirmed reading below 70 makes the watch vibrate.
+                LowGlucoseAlarmGuard.onReading(this@BondProbeService, sensor.glucose, System.currentTimeMillis())
                 scheduleNextReadingWindowAlarm("glucose packet")
                 DexcomConfigStore.saveScanDebug(
                     this@BondProbeService,

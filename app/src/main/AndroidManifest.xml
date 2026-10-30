@@ -162,5 +162,7 @@
             android:name=".ReadingWindowAlarmReceiver"
             android:exported="false" />
 
+            <!-- «Тихо 30 мин» on the low-glucose notice. -->
+        <receiver android:name=".LowAlarmSnoozeReceiver" android:exported="false" />
     </application>
 </manifest>
