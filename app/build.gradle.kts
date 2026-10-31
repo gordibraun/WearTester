@@ -10,9 +10,10 @@ android {
     defaultConfig {
         applicationId = "com.example.weartester"
         minSdk = 30
-        targetSdk = 34
-        versionCode = 21
-        versionName = "1.20"
+        // 32 on purpose: from 33 on an app may no longer switch Bluetooth off and on (the wedge cure).
+        targetSdk = 32
+        versionCode = 23
+        versionName = "1.22"
 
     }
     sourceSets.getByName("main").java.srcDir("../shared/src/main/java")

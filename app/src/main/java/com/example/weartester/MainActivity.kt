@@ -466,6 +466,12 @@ class MainActivity : Activity() {
         if (intent.getBooleanExtra(EXTRA_AUTO_START_PROBE, false)) {
             ensurePermissionsAndStart()
         }
+        if (intent.getBooleanExtra(EXTRA_DEBUG_BT_RESET, false)) {
+            // adb: am start -n com.example.weartester/.MainActivity --ez debug_bt_reset true
+            intent.removeExtra(EXTRA_DEBUG_BT_RESET)
+            ContextCompat.startForegroundService(this, Intent(this, BondProbeService::class.java).setAction(BondProbeService.ACTION_DEBUG_BT_RESET))
+            refreshStatus("Репетиция перезапуска Bluetooth")
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -584,6 +590,7 @@ class MainActivity : Activity() {
     companion object {
         private const val REQUEST_PERMISSIONS = 1001
         const val EXTRA_AUTO_START_PROBE = "auto_start_probe"
+        const val EXTRA_DEBUG_BT_RESET = "debug_bt_reset"
         const val EXTRA_FORCE_PAIRING_ATTENTION = "force_pairing_attention"
         const val EXTRA_OPEN_TIMER_FOCUS = "open_timer_focus"
         private const val TAG = "WearTesterMain"

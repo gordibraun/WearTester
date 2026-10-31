@@ -74,6 +74,8 @@ class BondProbeService : Service() {
 
     companion object {
         const val ACTION_READING_WINDOW_WAKE = "com.example.weartester.action.READING_WINDOW_WAKE"
+        /** A rehearsal of the Bluetooth self-reset, from the main screen (adb); the same path as a real wedge. */
+        const val ACTION_DEBUG_BT_RESET = "com.example.weartester.action.DEBUG_BT_RESET"
 
         private const val TAG = "BondProbe"
         private const val NOTIF_CH_ID = "bond_probe_channel"
@@ -160,6 +162,10 @@ class BondProbeService : Service() {
         private const val BT_WEDGE_LONG_AUTOCONNECT_MS = 3 * 60_000L
         /** Incident dumps for the same hang, over and over, cost more than they tell; keep the first few. */
         private const val BT_WEDGE_INCIDENTS_KEPT = 3
+        /** After our own disable() the adapter is switched back on at the OFF broadcast, and by these timers regardless. */
+        private const val BT_RESET_ENABLE_FALLBACK_MS = 10_000L
+        private const val BT_RESET_ENABLE_RETRY_MS = 25_000L
+        private const val BT_RESET_PENDING_KEY = "bt_reset_pending_at"
         private const val HIBERNATION_ALERT_REPEAT_MS = 12 * 60 * 60_000L
         /** OnePlus Watch 3 "Автоматическая гибернация": Settings.System, 1 (the default when unset) means on. */
         private const val ONEPLUS_AUTO_HIBERNATION_KEY = "device_deep_sleep"
@@ -199,6 +205,8 @@ class BondProbeService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val worker: ExecutorService = Executors.newSingleThreadExecutor()
     private val protocolWorker: ExecutorService = Executors.newSingleThreadExecutor()
+    /** The Bluetooth self-reset runs apart from the protocol worker, which may be waiting on the very link that wedged. */
+    private val btResetWorker: ExecutorService = Executors.newSingleThreadExecutor()
     private val watchdogWorker: ExecutorService = Executors.newSingleThreadExecutor()
     private val phoneRelayUdpWorker: ExecutorService = Executors.newSingleThreadExecutor()
     private val seenAdvertisers = linkedSetOf<String>()
@@ -218,6 +226,9 @@ class BondProbeService : Service() {
     @Volatile private var consecutiveConnectingTimeouts = 0
     @Volatile private var lastBtWedgeAlertAtMillis = 0L
     @Volatile private var btWedgeLongProbeTried = false
+    @Volatile private var lastBtResetAtMillis = 0L
+    @Volatile private var btResetsSinceGlucose = 0
+    @Volatile private var btResetStartedAtMillis = 0L
     @Volatile private var bondFlowStarted = false
     @Volatile private var sensorRequestSent = false
     @Volatile private var reconnectDelayMs = RECONNECT_DELAY_MS
@@ -308,6 +319,7 @@ class BondProbeService : Service() {
         registerBondReceiver()
         registerPairingReceiver()
         registerAdapterReceiver()
+        resumeInterruptedBluetoothReset()
         if (PhoneGlucoseRelayService.ENABLED) {
             registerPhoneRelayListeners()
         }
@@ -331,6 +343,10 @@ class BondProbeService : Service() {
         if (intent?.action == ACTION_READING_WINDOW_WAKE) {
             handleReadingWindowAlarm()
         }
+        if (intent?.action == ACTION_DEBUG_BT_RESET) {
+            ConnectionJournal.record(this, "bt_reset_debug_trigger")
+            btResetWorker.execute { resetBluetoothAdapter("debug rehearsal") }
+        }
         updateNotif(buildStartupText())
         requestComplicationRefresh("service start", force = true)
         if (PhoneGlucoseRelayService.ENABLED) {
@@ -350,6 +366,7 @@ class BondProbeService : Service() {
         unregisterPhoneRelayListeners()
         worker.shutdownNow()
         protocolWorker.shutdownNow()
+        btResetWorker.shutdownNow()
         watchdogWorker.shutdownNow()
         stopPhoneRelayUdpListener()
         phoneRelayUdpWorker.shutdownNow()
@@ -530,10 +547,14 @@ class BondProbeService : Service() {
                 BluetoothAdapter.STATE_TURNING_OFF,
                 BluetoothAdapter.STATE_OFF -> {
                     requestBleSessionRecovery("bluetooth adapter state=$state")
+                    if (state == BluetoothAdapter.STATE_OFF && btResetStartedAtMillis > 0L) {
+                        btResetWorker.execute { enableBluetoothAfterReset("adapter off") }
+                    }
                 }
 
                 BluetoothAdapter.STATE_ON -> {
                     ensureCollectorWakeLock("bluetooth adapter on")
+                    if (btResetStartedAtMillis > 0L) finishBluetoothReset("adapter on")
                     requestBleSessionRecovery("bluetooth adapter recovered")
                 }
             }
@@ -1632,6 +1653,7 @@ class BondProbeService : Service() {
                     }
                     consecutiveConnectingTimeouts = 0
                     btWedgeLongProbeTried = false
+                    btResetsSinceGlucose = 0
                     noteBluetoothWedge(false)
                     gattConnectStartedAtMillis = System.currentTimeMillis()
                     gattConnectedAtMillis = gattConnectStartedAtMillis
@@ -2496,13 +2518,19 @@ class BondProbeService : Service() {
 
     /**
      * Eight hung connects in a row with the sensor advertising all along: the Bluetooth stack has
-     * wedged. An app may not switch Bluetooth off and on (Android 13+ refuses non-system apps), so
-     * one long background connect is tried, and then the owner is told, loudly and with the
-     * Bluetooth settings one tap away, on the watch and through the phone.
+     * wedged (19 and 30 Oct 2026: three and ten hours without glucose, cured within a second by
+     * switching Bluetooth off and on). The collector now does that itself, rationed by
+     * [BluetoothResetPolicy]; between rations one long background connect is tried and the owner
+     * is told, loudly and with the Bluetooth settings one tap away, on the watch and through the phone.
      */
     private fun onBluetoothWedged() {
         noteBluetoothWedge(true)
         val now = System.currentTimeMillis()
+        if (BluetoothResetPolicy.shouldReset(now, lastBtResetAtMillis, btResetsSinceGlucose)) {
+            val hung = consecutiveConnectingTimeouts
+            btResetWorker.execute { resetBluetoothAdapter("$hung hung connects in a row") }
+            return
+        }
         if (!btWedgeLongProbeTried) {
             btWedgeLongProbeTried = true
             ConnectionJournal.record(this, "bt_wedge_detected", "timeouts" to consecutiveConnectingTimeouts)
@@ -2518,8 +2546,16 @@ class BondProbeService : Service() {
         }
         if (now - lastBtWedgeAlertAtMillis < BT_WEDGE_ALERT_REPEAT_MS) return
         lastBtWedgeAlertAtMillis = now
+        val resets = if (btResetsSinceGlucose > 0) " Автоперезапуск Bluetooth ($btResetsSinceGlucose) не помог." else ""
+        notifyBluetoothProblem(
+            "Bluetooth часов завис",
+            "Сенсор виден, но $consecutiveConnectingTimeouts подключений подряд зависли: Bluetooth часов завис.$resets Выключите и включите Bluetooth на часах (Настройки → Подключения).",
+        )
+        DexcomConfigStore.saveScanDebug(this, "", config.knownMac, null, "bluetooth завис: $consecutiveConnectingTimeouts подключений подряд не прошли")
+    }
+
+    private fun notifyBluetoothProblem(title: String, text: String) {
         vibrateAlert()
-        val text = "Сенсор виден, но $consecutiveConnectingTimeouts подключений подряд зависли: Bluetooth часов завис. Выключите и включите Bluetooth на часах (Настройки → Подключения)."
         val open = PendingIntent.getActivity(
             this, 1046,
             Intent(Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
@@ -2529,7 +2565,7 @@ class BondProbeService : Service() {
             BT_WEDGE_NOTIF_ID,
             NotificationCompat.Builder(this, ALERT_CH_ID)
                 .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-                .setContentTitle("Bluetooth часов завис")
+                .setContentTitle(title)
                 .setContentText(text)
                 .setStyle(NotificationCompat.BigTextStyle().bigText(text))
                 .setPriority(NotificationCompat.PRIORITY_MAX)
@@ -2538,7 +2574,107 @@ class BondProbeService : Service() {
                 .setAutoCancel(true)
                 .build(),
         )
-        DexcomConfigStore.saveScanDebug(this, "", config.knownMac, null, "bluetooth завис: $consecutiveConnectingTimeouts подключений подряд не прошли")
+    }
+
+    /**
+     * The adapter off and on again, by the collector itself. Possible only because the app targets
+     * SDK 32: for apps targeting 33 and above disable()/enable() return false and do nothing
+     * (BluetoothManagerService, RESTRICT_ENABLE_DISABLE). The pending mark outlives the process,
+     * so a death between the two calls never leaves Bluetooth off by our hand.
+     */
+    private fun resetBluetoothAdapter(reason: String): Boolean {
+        val adapter = btAdapter
+        val skip = when {
+            adapter == null              -> "no adapter"
+            !adapter.isEnabled           -> "adapter not enabled (state ${adapter.state})"
+            btResetStartedAtMillis > 0L  -> "reset already in progress since $btResetStartedAtMillis"
+            else                         -> null
+        }
+        if (skip != null || adapter == null) {
+            ConnectionJournal.record(this, "bt_reset_skipped", "reason" to reason, "why" to (skip ?: "no adapter"))
+            return false
+        }
+        val now = System.currentTimeMillis()
+        lastBtResetAtMillis = now
+        btResetsSinceGlucose += 1
+        btResetStartedAtMillis = now
+        markBluetoothResetPending(now)
+        closeGatt("bluetooth reset: $reason")
+        runCatching { stopScan() }
+        @Suppress("DEPRECATION")
+        val accepted = runCatching { adapter.disable() }
+            .getOrElse { Log.e(TAG, "Bluetooth disable failed: ${it.message}"); false }
+        ConnectionJournal.record(this, "bt_reset_requested", "reason" to reason, "accepted" to accepted,
+            "timeouts" to consecutiveConnectingTimeouts, "resets_since_glucose" to btResetsSinceGlucose)
+        Log.w(TAG, "Bluetooth self-reset ($reason): disable accepted=$accepted")
+        if (!accepted) {
+            btResetStartedAtMillis = 0L
+            markBluetoothResetPending(0L)
+            DexcomConfigStore.saveScanDebug(this, "", config.knownMac, null, "перезапуск bluetooth отклонён системой: $reason")
+            return false
+        }
+        consecutiveConnectingTimeouts = 0
+        btWedgeLongProbeTried = false
+        val at = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(now))
+        DexcomConfigStore.saveScanDebug(this, "", config.knownMac, null, "перезапуск bluetooth $at: $reason")
+        updateNotif("Bluetooth перезапущен в $at (подключения зависали), жду сенсор")
+        mainHandler.postDelayed({ btResetWorker.execute { enableBluetoothAfterReset("fallback") } }, BT_RESET_ENABLE_FALLBACK_MS)
+        mainHandler.postDelayed({ btResetWorker.execute { enableBluetoothAfterReset("retry") } }, BT_RESET_ENABLE_RETRY_MS)
+        return true
+    }
+
+    private fun enableBluetoothAfterReset(reason: String) {
+        if (btResetStartedAtMillis <= 0L) return
+        val adapter = btAdapter ?: return
+        val state = adapter.state
+        if (state == BluetoothAdapter.STATE_ON) {
+            // Back on before the broadcast reached us, or never went off: either way the reset is over.
+            finishBluetoothReset("already on at $reason")
+            return
+        }
+        if (state == BluetoothAdapter.STATE_TURNING_ON) return
+        @Suppress("DEPRECATION")
+        val accepted = runCatching { adapter.enable() }
+            .getOrElse { Log.e(TAG, "Bluetooth enable failed: ${it.message}"); false }
+        ConnectionJournal.record(this, "bt_reset_enable", "reason" to reason, "accepted" to accepted, "state" to state)
+        Log.w(TAG, "Bluetooth self-reset: enable ($reason) accepted=$accepted from state $state")
+        if (!accepted) alertBluetoothLeftOff()
+    }
+
+    private fun finishBluetoothReset(how: String) {
+        val started = btResetStartedAtMillis
+        if (started <= 0L) return
+        btResetStartedAtMillis = 0L
+        markBluetoothResetPending(0L)
+        val took = System.currentTimeMillis() - started
+        ConnectionJournal.record(this, "bt_reset_done", "took_ms" to took, "how" to how)
+        Log.w(TAG, "Bluetooth self-reset finished in ${took}ms ($how)")
+    }
+
+    private fun alertBluetoothLeftOff() {
+        notifyBluetoothProblem(
+            "Bluetooth часов выключен",
+            "После перезапуска Bluetooth не включился сам. Включите его: Настройки → Подключения → Bluetooth.",
+        )
+    }
+
+    private fun markBluetoothResetPending(at: Long) {
+        getSharedPreferences(ConnectionMonitor.PREFS, Context.MODE_PRIVATE).edit().putLong(BT_RESET_PENDING_KEY, at).apply()
+    }
+
+    /** The process died between our disable() and enable(): Bluetooth goes back on before anything else. */
+    private fun resumeInterruptedBluetoothReset() {
+        val prefs = getSharedPreferences(ConnectionMonitor.PREFS, Context.MODE_PRIVATE)
+        val pendingAt = prefs.getLong(BT_RESET_PENDING_KEY, 0L)
+        if (pendingAt <= 0L) return
+        val adapter = btAdapter
+        if (adapter != null && !adapter.isEnabled) {
+            @Suppress("DEPRECATION")
+            val accepted = runCatching { adapter.enable() }.getOrElse { false }
+            ConnectionJournal.record(this, "bt_reset_resumed", "pending_since" to pendingAt, "accepted" to accepted)
+            if (!accepted) alertBluetoothLeftOff()
+        }
+        markBluetoothResetPending(0L)
     }
 
     /** What the phone is told with every heartbeat; see [ConnectionMonitor]. */
